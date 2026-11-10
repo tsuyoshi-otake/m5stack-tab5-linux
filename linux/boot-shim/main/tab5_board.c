@@ -97,9 +97,8 @@ static const char *TAG = "tab5-board";
 /* 0x43 pins: P1 SPK_EN, P2 EXT5V_EN, P4 LCD_RST, P5 TP_RST, P6 CAM_RST.
  * 0x44 pins: P0 WLAN_PWR_EN, P3 USB5V_EN, P4 PWROFF(keep 0), P5 nCHG_QC_EN,
  * P7 CHG_EN (stock parity per board-contract.json). */
-#define EXP0_OUT_SAFE 0x60u /* P5|P6 released per contract; see note below */
 #define EXP0_OUT_OFF 0x00u
-#define EXP1_OUT_BOOT 0xA9u /* P0|P3|P5|P7 = WLAN,USB5V,nCHG_QC,CHG_EN */
+#define EXP1_OUT_BOOT 0x89u /* P0|P3|P7 = WLAN_PWR,USB5V,CHG_EN; QC_EN=0 */
 
 static inline volatile uint32_t *reg32(uint32_t addr)
 {
@@ -244,10 +243,11 @@ static esp_err_t expanders_init(void)
 			    TAG, "exp0 pull_sel");
 	ESP_RETURN_ON_ERROR(expander_write(s_exp0, PI4IO_REG_PULL_EN, 0x10u),
 			    TAG, "exp0 pull_en"); /* P4 pulled up */
-	ESP_RETURN_ON_ERROR(expander_write(s_exp0, PI4IO_REG_IO_DIR, 0x10u),
-			    TAG, "exp0 io_dir"); /* P4 input, rest outputs */
+	ESP_RETURN_ON_ERROR(expander_write(s_exp0, PI4IO_REG_IO_DIR, 0x90u),
+			    TAG, "exp0 io_dir"); /* P4 LCD_RST + P7 hp-detect inputs */
 
-	/* Expander 0x44: C6 rail on; USB-A 5 V, nCHG_QC, CHG_EN at stock parity. */
+	/* Expander 0x44: C6 rail on; USB-A 5 V and CHG_EN at stock parity,
+	 * nCHG_QC_EN=0 (QC enabled per contract), PWROFF=0. */
 	ESP_RETURN_ON_ERROR(expander_write(s_exp1, PI4IO_REG_OUT_SET, EXP1_OUT_BOOT),
 			    TAG, "exp1 out_set");
 	ESP_RETURN_ON_ERROR(expander_write(s_exp1, PI4IO_REG_OUT_H_IM, 0x00u),
