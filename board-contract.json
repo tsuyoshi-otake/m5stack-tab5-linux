@@ -59,7 +59,7 @@
     "P2": { "function": "EXT5V_EN", "boot_state": "out 0 (off to save power; stock drives 1)" },
     "P3": { "function": "reserved", "boot_state": "out 0" },
     "P4": { "function": "LCD_RST", "boot_state": "latch 0, drive low ~10ms, release as input+pull-up" },
-    "P5": { "function": "TP_RST/TP_EN", "boot_state": "out 0 (touch held off at boot)" },
+    "P5": { "function": "TP_RST/TP_EN", "boot_state": "out 1 (released; ST7123 is a combined display+touch chip - holding it in reset is untested; stock drives 1)" },
     "P6": { "function": "CAM_RST", "boot_state": "out 0 (camera held off)" },
     "P7": { "function": "headphone detect", "boot_state": "input" }
   },

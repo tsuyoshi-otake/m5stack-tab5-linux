@@ -59,12 +59,14 @@ printf 'ES_SDIO_CLOCK_EVIDENCE requested_mhz=%s module_param_mhz=%s clkdiv=%s cl
 	"$(devmem $((base + 0x10)) 32)" \
 	"${module_sha256:-unavailable}"
 echo "gpio-sdio-inputs:"
-# GPIO_IN1/OUT1/ENABLE1 are read-only snapshots here. GPIO10 is DAT1 and
-# GPIO15 is the C6 reset/EN line; the matrix values verify that the boot shim
-# selected the intended input routes without changing hardware state.
+# GPIO_IN/OUT/ENABLE are read-only snapshots here; the Tab5 SDIO pins are
+# bank 0 (GPIO8-13, reset GPIO15).  The IN_SEL registers are indexed by
+# peripheral signal, not GPIO number: signal 3 is SD_CARD_CDATA1_2_PAD_IN
+# and shows which GPIO feeds DAT1; signal 129 is the card-interrupt input
+# the shim ties high.
 for entry in \
-	GPIO_IN1:0x500e0040 GPIO_OUT1:0x500e0010 GPIO_ENABLE1:0x500e002c \
-	GPIO10_IN_SEL:0x500e0174 SDIO_CARD_INT_IN_SEL:0x500e035c; do
+	GPIO_IN:0x500e003c GPIO_OUT:0x500e0004 GPIO_ENABLE:0x500e0020 \
+	DAT1_IN_SEL:0x500e0164 SDIO_CARD_INT_IN_SEL:0x500e035c; do
 	name=${entry%%:*}
 	address=${entry##*:}
 	printf '%-18s %s\n' "$name" "$(devmem "$address" 32)"

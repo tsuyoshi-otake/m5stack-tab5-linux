@@ -81,7 +81,7 @@
 	 * a dcache writeback before the DW-GDMA reader sees them; consumed
 	 * by the optional simplefb patch under linux/tab5/.
 	 */
-	framebuffer0: framebuffer@0dfb000 {
+	framebuffer0: framebuffer@dfb0000 {
 		compatible = "simple-framebuffer";
 		reg = <0x0dfb0000 0x001c2000>;
 		width = <720>;

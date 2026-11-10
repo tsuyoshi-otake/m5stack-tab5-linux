@@ -397,10 +397,15 @@ if ! $network_profile; then
 	# non-network profile.  Also remove them in post-build: an old shared
 	# Buildroot target directory can retain files after its overlay input is
 	# gone.
-	rm -f -- \
-		"${external_root}/${board_dir}/rootfs-overlay/etc/init.d/S40network" \
-		"${external_root}/${board_dir}/rootfs-overlay/etc/init.d/S41timesync" \
-		"${external_root}/${board_dir}/rootfs-overlay/usr/sbin/sdio-diag"
+	# Tab5 shares the Stamp overlay via BR2_ROOTFS_OVERLAY, so the
+	# network files must be removed from every board overlay that can
+	# feed this image, not only the selected one.
+	for rm_board in stamp-p4 tab5; do
+		rm -f -- \
+			"${external_root}/board/${rm_board}/rootfs-overlay/etc/init.d/S40network" \
+			"${external_root}/board/${rm_board}/rootfs-overlay/etc/init.d/S41timesync" \
+			"${external_root}/board/${rm_board}/rootfs-overlay/usr/sbin/sdio-diag"
+	done
 	cat >>"${external_root}/${board_dir}/post-build.sh" <<'EOF'
 
 # Non-network profile boundary: do not let a reused Buildroot target retain

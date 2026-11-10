@@ -448,6 +448,9 @@ static bool patch_rootfs_window(uint8_t *dtb, uint32_t total,
  *     keeps simplefb off the node when the panel never came up; the
  *     value is unique in the strings block so no other node is hit)
  */
+/* Count then patch: a placeholder that matches more than once (or not
+ * at all) means the DTB does not look like the one this shim was built
+ * for; fail closed rather than corrupting an unrelated cell. */
 static bool patch_reg_pair_once(uint8_t *dtb, uint32_t total,
 				uint32_t magic, uint32_t pa, uint32_t bytes)
 {
@@ -455,19 +458,23 @@ static bool patch_reg_pair_once(uint8_t *dtb, uint32_t total,
 		(uint8_t)(magic >> 24), (uint8_t)(magic >> 16),
 		(uint8_t)(magic >> 8), (uint8_t)magic,
 	};
+	uint32_t hits = 0, at = 0;
 	for (uint32_t i = 0; i + 8 <= total; ++i) {
 		if (!memcmp(dtb + i, want, sizeof(want))) {
-			uint8_t replacement[8] = {
-				(uint8_t)(pa >> 24), (uint8_t)(pa >> 16),
-				(uint8_t)(pa >> 8), (uint8_t)pa,
-				(uint8_t)(bytes >> 24), (uint8_t)(bytes >> 16),
-				(uint8_t)(bytes >> 8), (uint8_t)bytes,
-			};
-			memcpy(dtb + i, replacement, sizeof(replacement));
-			return true;
+			hits++;
+			at = i;
 		}
 	}
-	return false;
+	if (hits != 1)
+		return false;
+	uint8_t replacement[8] = {
+		(uint8_t)(pa >> 24), (uint8_t)(pa >> 16),
+		(uint8_t)(pa >> 8), (uint8_t)pa,
+		(uint8_t)(bytes >> 24), (uint8_t)(bytes >> 16),
+		(uint8_t)(bytes >> 8), (uint8_t)bytes,
+	};
+	memcpy(dtb + at, replacement, sizeof(replacement));
+	return true;
 }
 
 static bool patch_display_window(uint8_t *dtb, uint32_t total,
@@ -480,15 +487,17 @@ static bool patch_display_window(uint8_t *dtb, uint32_t total,
 	if (!patch_reg_pair_once(dtb, total, 0x49fdf000u, fb_pa, fb_bytes))
 		ok = false;
 	static const char status_needle[] = "reserved-fb";
-	bool status_patched = false;
+	uint32_t status_hits = 0, status_at = 0;
 	for (uint32_t i = 0; i + sizeof(status_needle) <= total; ++i) {
 		if (!memcmp(dtb + i, status_needle, sizeof(status_needle) - 1)) {
-			memcpy(dtb + i, "okay", 5);
-			status_patched = true;
-			break;
+			status_hits++;
+			status_at = i;
 		}
 	}
-	return ok && status_patched;
+	if (status_hits != 1)
+		return false;
+	memcpy(dtb + status_at, "okay", 5);
+	return ok;
 }
 #endif /* BOARD_TAB5 */
 

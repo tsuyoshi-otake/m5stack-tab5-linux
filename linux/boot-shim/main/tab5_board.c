@@ -10,13 +10,16 @@
  * be programmed before the reset pulse.
  *
  * Safety contract (board-contract.json): the speaker amp (0x43 P1),
- * touch (P5), camera (P6), USB-A 5 V (0x44 P3) and EXT5V (0x43 P2) stay
- * OFF at boot.  The stock image repeatedly tripped the brownout detector
- * on plain USB power with speaker + backlight + C6 all up
- * (live-log.txt BOD resets), so Linux keeps the same conservative state.
- * The LCD reset line (0x43 P4) is released via the BSP's open-drain /
- * input-pull-up sequence so the ST7123 can be initialised; the
- * backlight (GPIO22) is driven low until Linux or a user asks for it.
+ * camera (P6) and EXT5V (0x43 P2) stay OFF at boot, while USB-A 5 V
+ * (0x44 P3), QC and CHG_EN follow the stock image.  The stock image
+ * repeatedly tripped the brownout detector on plain USB power with
+ * speaker + backlight + C6 all up (live-log.txt BOD resets), so Linux
+ * keeps the conservative subset.  The LCD reset line (0x43 P4) goes
+ * through the stock assert-then-release sequence (output low 10 ms,
+ * then input with internal pull-up) and TP_RST (0x43 P5) is driven 1
+ * as in stock: the ST7123 is a combined display+touch chip and holding
+ * its touch reset low while the display is initialised is untested.
+ * The backlight (GPIO22) is driven low until Linux or a user asks.
  */
 
 #include <stdint.h>
@@ -84,21 +87,46 @@ static const char *TAG = "tab5-board";
 #define TAB5_I2C_SCL_GPIO 32
 #define TAB5_I2C_HZ 400000u
 
-/* PI4IOE5V6408 registers (esp_io_expander_pi4ioe5v6408.c). */
-#define PI4IO_REG_IO_DIR 0x03u /* 1=input (default 0xff) */
+/* PI4IOE5V6408 registers (esp_io_expander_pi4ioe5v6408.c and the stock
+ * bsp_io_expander_pi4ioe_init in m5stack_tab5.c).  IO_DIR: 1=output,
+ * 0=input -- the "0: input 1: output" comment at m5stack_tab5.c:303. */
+#define PI4IO_REG_CHIP_RESET 0x01u
+#define PI4IO_REG_IO_DIR 0x03u /* 1=output, 0=input */
 #define PI4IO_REG_OUT_SET 0x05u
-#define PI4IO_REG_OUT_H_IM 0x07u /* 1=open-drain/high-Z (default 0xff) */
+#define PI4IO_REG_OUT_H_IM 0x07u /* 1=high-Z output mode */
+#define PI4IO_REG_IN_DEF_STA 0x09u
 #define PI4IO_REG_PULL_EN 0x0Bu
-#define PI4IO_REG_PULL_SEL 0x0Du /* 1=pull-up */
+#define PI4IO_REG_PULL_SEL 0x0Du /* 1=pull-up, 0=pull-down */
+#define PI4IO_REG_INT_MASK 0x11u /* 1=irq masked */
 
 #define EXPANDER0_ADDR 0x43u
 #define EXPANDER1_ADDR 0x44u
 
-/* 0x43 pins: P1 SPK_EN, P2 EXT5V_EN, P4 LCD_RST, P5 TP_RST, P6 CAM_RST.
- * 0x44 pins: P0 WLAN_PWR_EN, P3 USB5V_EN, P4 PWROFF(keep 0), P5 nCHG_QC_EN,
- * P7 CHG_EN (stock parity per board-contract.json). */
-#define EXP0_OUT_OFF 0x00u
-#define EXP1_OUT_BOOT 0x89u /* P0|P3|P7 = WLAN_PWR,USB5V,CHG_EN; QC_EN=0 */
+/* 0x43 pins: P0 EXT_ANT_EN, P1 SPK_EN, P2 EXT5V_EN, P4 LCD_RST,
+ * P5 TP_RST, P6 CAM_RST, P7 hp-detect(input).  Stock latches 0x66 and
+ * drives P5 high; the Linux profile keeps speaker/EXT5V/camera off, so
+ * only TP_RST is 1.  P4 stays latched 0 across the whole sequence so
+ * the output phase pulls the 1.8 V reset line low without ever
+ * push-pulling 3.3 V onto it (m5stack_tab5.c comment at the OUT_SET
+ * write). */
+#define EXP0_OUT_BOOT 0x20u /* P5 TP_RST released; all other outputs 0 */
+#define EXP0_PULLS 0x7fu    /* stock: pull-up on P0..P6, none on P7 */
+#define EXP0_DIR_ASSERT 0x7fu /* P0..P6 outputs -> P4 drives LCD_RST low */
+#define EXP0_DIR_RELEASE 0x6fu /* P4 back to input -> pull-up releases */
+
+/* 0x44 pins: P0 WLAN_PWR_EN, P3 USB5V_EN, P4 PWROFF(keep 0),
+ * P5 nCHG_QC_EN (0 = QC on), P7 CHG_EN; P1/P2/P6 stay inputs. */
+#define EXP1_OUT_INIT 0x09u /* stock init: P0|P3 high, charge off */
+#define EXP1_OUT_BOOT 0x89u /* +P7: stock reaches this via
+			     * bsp_set_charge_en(true) shortly after
+			     * expander init ("set charge enable: true"
+			     * in boot-log.txt). */
+#define EXP1_DIR 0xb9u   /* stock: P0,P3,P4,P5,P7 out; P1,P2,P6 in */
+#define EXP1_OUT_H_IM 0x06u /* stock: P1/P2 high-Z */
+#define EXP1_PULL_SEL 0xb9u /* stock */
+#define EXP1_PULL_EN 0xf9u  /* stock: pulls on P0,P3,P4,P5,P6,P7 */
+#define EXP1_IN_DEF_STA 0x40u /* stock: P6 compare-default high */
+#define EXP1_INT_MASK 0xbfu   /* stock: P6 unmasked */
 
 static inline volatile uint32_t *reg32(uint32_t addr)
 {
@@ -116,9 +144,10 @@ static inline void clear_set_bits(uint32_t addr, uint32_t clear, uint32_t set)
 	*reg32(addr) = (value & ~clear) | set;
 }
 
-/* GPIO0..25 sit at gpio*4 in the P4 IO_MUX map; GPIO26 moves to 0x6c
- * (the gap at 0x68 that m2_sdmmc.c documents for the Stamp pins 42..48).
- * All Tab5 SDIO pins are <= 15, so the plain gpio*4 mapping applies. */
+/* P4 IO_MUX pad registers sit at (gpio + 1) * 4 for the whole GPIO0..54
+ * range: GPIO0 -> +0x4, GPIO8 -> +0x24, GPIO12 -> +0x34, GPIO15 -> +0x40,
+ * GPIO42 -> +0xac (vendor io_mux_reg.h; the same rule produces the
+ * 0xac..0xc4 Stamp table in m2_sdmmc.c). */
 static void configure_iomux_gpio(uint32_t gpio, bool pullup)
 {
 	uint32_t clear = IOMUX_FUN_PD | IOMUX_FUN_PU | IOMUX_FUN_IE |
@@ -126,7 +155,7 @@ static void configure_iomux_gpio(uint32_t gpio, bool pullup)
 	uint32_t set = IOMUX_FUN_IE | (3u << 10) | (PIN_FUNC_GPIO << 12);
 	if (pullup)
 		set |= IOMUX_FUN_PU;
-	clear_set_bits(IO_MUX_BASE + (gpio * 4u), clear, set);
+	clear_set_bits(IO_MUX_BASE + ((gpio + 1u) * 4u), clear, set);
 }
 
 static void route_output(uint32_t gpio, uint32_t signal)
@@ -197,18 +226,35 @@ static esp_err_t expander_write(i2c_master_dev_handle_t dev, uint8_t reg,
 }
 
 /*
- * Write the safe boot state to both expanders.  Direction register
- * defaults to all-input after reset, so programming OUT_SET first and
- * IO_DIR last avoids any glitch on the rails we switch on.
+ * Program both expanders following the stock sequence in
+ * bsp_io_expander_pi4ioe_init (m5stack_tab5.c:245-330), with only the
+ * output levels changed for the Linux power profile.
  *
- * 0x43 (EXPANDER0): all eight pins become push-pull outputs with level 0
- *   except P4 LCD_RST, which stays as an input with pull-up enabled so
- *   the panel comes out of reset (the BSP drives the same open-drain
- *   sequence: set_dir INPUT + set_pullupdown UP + output mode OPEN_DRAIN).
- * 0x44 (EXPANDER1): all outputs, levels 0xA9 -> C6 rail on (P0), USB-A
- *   5 V on (P3, stock parity), nCHG_QC_EN 0, CHG_EN 1 (stock parity),
- *   PWROFF 0 (never pulsed at boot).
+ * 0x43: chip reset; pulls; OUT_SET latch (P4=0, TP_RST=1); OUT_H_IM=0
+ *   (push-pull); IO_DIR=0x7f so P4 becomes an output and drives LCD_RST
+ *   low for 10 ms; IO_DIR=0x6f returns P4 to an input whose internal
+ *   pull-up releases the panel reset; stock waits 50 ms after release.
+ *   Never latch P4 high: the line has no 1.8 V pull-up and must not be
+ *   push-pull driven to 3.3 V.
+ * 0x44: chip reset; IO_DIR=0xb9 (P0,P3,P4,P5,P7 outputs; P1,P2,P6
+ *   inputs); OUT_H_IM / PULL_SEL / PULL_EN / IN_DEF_STA / INT_MASK at
+ *   the stock values; OUT_SET=0x09 (C6 rail + USB-A 5 V on, charge off)
+ *   then 0x89 to match the stock image after its charge-enable call.
  */
+static esp_err_t expander_reset(i2c_master_dev_handle_t dev)
+{
+	uint8_t cmd = PI4IO_REG_CHIP_RESET;
+	uint8_t ff[] = { PI4IO_REG_CHIP_RESET, 0xffu };
+	uint8_t ack = 0;
+
+	ESP_RETURN_ON_ERROR(i2c_master_transmit(dev, ff, sizeof(ff), 100),
+			    TAG, "expander reset write");
+	ESP_RETURN_ON_ERROR(i2c_master_transmit_receive(dev, &cmd, 1, &ack, 1,
+							100),
+			    TAG, "expander reset read");
+	return ESP_OK;
+}
+
 static esp_err_t expanders_init(void)
 {
 	i2c_master_bus_config_t bus_cfg = {
@@ -233,30 +279,49 @@ static esp_err_t expanders_init(void)
 	ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(s_i2c_bus, &dev_cfg, &s_exp1),
 			    TAG, "expander 0x44 add failed");
 
-	/* Expander 0x43: outputs default low (speaker/touch/camera/EXT5V off).
-	 * LCD_RST (P4): input with pull-up + open-drain -> panel out of reset. */
-	ESP_RETURN_ON_ERROR(expander_write(s_exp0, PI4IO_REG_OUT_SET, EXP0_OUT_OFF),
-			    TAG, "exp0 out_set");
-	ESP_RETURN_ON_ERROR(expander_write(s_exp0, PI4IO_REG_OUT_H_IM, 0x10u),
-			    TAG, "exp0 out_h_im"); /* P4 high-Z/open-drain */
-	ESP_RETURN_ON_ERROR(expander_write(s_exp0, PI4IO_REG_PULL_SEL, 0xffu),
-			    TAG, "exp0 pull_sel");
-	ESP_RETURN_ON_ERROR(expander_write(s_exp0, PI4IO_REG_PULL_EN, 0x10u),
-			    TAG, "exp0 pull_en"); /* P4 pulled up */
-	ESP_RETURN_ON_ERROR(expander_write(s_exp0, PI4IO_REG_IO_DIR, 0x90u),
-			    TAG, "exp0 io_dir"); /* P4 LCD_RST + P7 hp-detect inputs */
+	/* --- 0x43: stock order, TP_RST high, speaker/EXT5V/camera off --- */
+	ESP_RETURN_ON_ERROR(expander_reset(s_exp0), TAG, "exp0 reset");
+	ESP_RETURN_ON_ERROR(expander_write(s_exp0, PI4IO_REG_PULL_SEL,
+					   EXP0_PULLS), TAG, "exp0 pull_sel");
+	ESP_RETURN_ON_ERROR(expander_write(s_exp0, PI4IO_REG_PULL_EN,
+					   EXP0_PULLS), TAG, "exp0 pull_en");
+	ESP_RETURN_ON_ERROR(expander_write(s_exp0, PI4IO_REG_OUT_SET,
+					   EXP0_OUT_BOOT), TAG, "exp0 out_set");
+	ESP_RETURN_ON_ERROR(expander_write(s_exp0, PI4IO_REG_OUT_H_IM, 0x00u),
+			    TAG, "exp0 out_h_im");
+	ESP_RETURN_ON_ERROR(expander_write(s_exp0, PI4IO_REG_IO_DIR,
+					   EXP0_DIR_ASSERT),
+			    TAG, "exp0 io_dir assert");
+	esp_rom_delay_us(10000);
+	ESP_RETURN_ON_ERROR(expander_write(s_exp0, PI4IO_REG_IO_DIR,
+					   EXP0_DIR_RELEASE),
+			    TAG, "exp0 io_dir release");
+	esp_rom_delay_us(50000);
 
-	/* Expander 0x44: C6 rail on; USB-A 5 V and CHG_EN at stock parity,
-	 * nCHG_QC_EN=0 (QC enabled per contract), PWROFF=0. */
-	ESP_RETURN_ON_ERROR(expander_write(s_exp1, PI4IO_REG_OUT_SET, EXP1_OUT_BOOT),
-			    TAG, "exp1 out_set");
-	ESP_RETURN_ON_ERROR(expander_write(s_exp1, PI4IO_REG_OUT_H_IM, 0x00u),
-			    TAG, "exp1 out_h_im");
-	ESP_RETURN_ON_ERROR(expander_write(s_exp1, PI4IO_REG_IO_DIR, 0x46u),
-			    TAG, "exp1 io_dir"); /* P1,P2,P6 inputs */
+	/* --- 0x44: exact stock sequence, then charge-enable --- */
+	ESP_RETURN_ON_ERROR(expander_reset(s_exp1), TAG, "exp1 reset");
+	ESP_RETURN_ON_ERROR(expander_write(s_exp1, PI4IO_REG_IO_DIR, EXP1_DIR),
+			    TAG, "exp1 io_dir");
+	ESP_RETURN_ON_ERROR(expander_write(s_exp1, PI4IO_REG_OUT_H_IM,
+					   EXP1_OUT_H_IM), TAG, "exp1 out_h_im");
+	ESP_RETURN_ON_ERROR(expander_write(s_exp1, PI4IO_REG_PULL_SEL,
+					   EXP1_PULL_SEL), TAG, "exp1 pull_sel");
+	ESP_RETURN_ON_ERROR(expander_write(s_exp1, PI4IO_REG_PULL_EN,
+					   EXP1_PULL_EN), TAG, "exp1 pull_en");
+	ESP_RETURN_ON_ERROR(expander_write(s_exp1, PI4IO_REG_IN_DEF_STA,
+					   EXP1_IN_DEF_STA),
+			    TAG, "exp1 in_def_sta");
+	ESP_RETURN_ON_ERROR(expander_write(s_exp1, PI4IO_REG_INT_MASK,
+					   EXP1_INT_MASK), TAG, "exp1 int_mask");
+	ESP_RETURN_ON_ERROR(expander_write(s_exp1, PI4IO_REG_OUT_SET,
+					   EXP1_OUT_INIT), TAG, "exp1 out_set");
+	ESP_RETURN_ON_ERROR(expander_write(s_exp1, PI4IO_REG_OUT_SET,
+					   EXP1_OUT_BOOT),
+			    TAG, "exp1 charge en");
 
 	esp_rom_delay_us(C6_POWER_UP_DELAY_US);
-	ESP_LOGI(TAG, "expanders: C6 rail on, amp/touch/camera off, LCD released");
+	ESP_LOGI(TAG, "expanders: C6 rail on, LCD_RST pulsed+released, "
+		 "amp/EXT5V/camera off");
 	return ESP_OK;
 }
 

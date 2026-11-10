@@ -31,12 +31,17 @@ BR2_TARGET_GENERIC_GETTY_PORT="ttyS0"
 BR2_TARGET_GENERIC_GETTY_BAUDRATE_115200=y
 BR2_TARGET_GENERIC_REMOUNT_ROOTFS_READ_ONLY=y
 BR2_INIT_BUSYBOX=y
-BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_STAMP_P4_PATH)/board/tab5/busybox.fragment"
+# Shared with the Stamp board: busybox fragment, post-image script and the
+# bulk of the rootfs overlay live under board/stamp-p4/.  board/tab5 only
+# carries the files that differ (motd, sdio-diag, users.txt) and a
+# post-build.sh wrapper that delegates to the shared script; the tab5
+# overlay is listed last so its copies win.
+BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_STAMP_P4_PATH)/board/stamp-p4/busybox.fragment"
 BR2_ROOTFS_DEVICE_CREATION_DYNAMIC_DEVTMPFS=y
-BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_STAMP_P4_PATH)/board/tab5/rootfs-overlay"
+BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_STAMP_P4_PATH)/board/stamp-p4/rootfs-overlay $(BR2_EXTERNAL_STAMP_P4_PATH)/board/tab5/rootfs-overlay"
 BR2_ROOTFS_USERS_TABLES="$(BR2_EXTERNAL_STAMP_P4_PATH)/board/tab5/users.txt"
 BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_STAMP_P4_PATH)/board/tab5/post-build.sh"
-BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_STAMP_P4_PATH)/board/tab5/post-image.sh"
+BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_STAMP_P4_PATH)/board/stamp-p4/post-image.sh"
 BR2_PACKAGE_DROPBEAR=y
 BR2_PACKAGE_DROPBEAR_CLIENT=y
 BR2_PACKAGE_DROPBEAR_DISABLE_REVERSEDNS=y
