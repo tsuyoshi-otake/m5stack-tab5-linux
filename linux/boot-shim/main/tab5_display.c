@@ -63,6 +63,7 @@
 #include "esp_heap_caps.h"
 #include "esp_rom_sys.h"
 #include "hal/cache_hal.h"
+#include "hal/cache_ll.h"
 #include "hal/dw_gdma_ll.h"
 #include "hal/mipi_dsi_brg_ll.h"
 #include "soc/dw_gdma_struct.h"
@@ -165,8 +166,10 @@ static int scanout_find_channel(void)
  * contract the kernel DSI-scanout driver implements. */
 static void scanout_rearm(int ch)
 {
+	/* Write through the uncached alias, as dw_gdma.c does (items_nc):
+	 * the DMA reads the item from RAM, not from the L1 data cache. */
 	volatile dw_gdma_link_list_item_t *lli =
-		(void *)(uintptr_t)s_scanout_lli_pa;
+		(void *)CACHE_LL_L2MEM_NON_CACHE_ADDR(s_scanout_lli_pa);
 	lli->ctrl_hi.val |= DWGDMA_LLI_CTRL_VALID | DWGDMA_LLI_CTRL_LAST;
 	gdma->ch[ch].llp0.loc0 = s_scanout_lli_pa >> 6;
 	dw_gdma_ll_channel_enable(gdma, ch, true);

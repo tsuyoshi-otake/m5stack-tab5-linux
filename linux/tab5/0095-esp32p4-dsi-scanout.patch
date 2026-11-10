@@ -168,7 +168,7 @@ Only staged for ES_BOARD=tab5 builds (linux/build-m1.sh).
 +		return -ENODEV;
 +	}
 +
-+	s->lli = ioremap(s->lli_pa, 64);
++	s->lli = ioremap(s->lli_pa + 0x40000000 /* uncached alias: the DMA reads RAM, not the L1 cache */, 64);
 +	if (!s->lli)
 +		return -ENOMEM;
 +
