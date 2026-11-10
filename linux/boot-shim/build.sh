@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
 	cat >&2 <<'EOF'
-Usage: build.sh <output-directory> [--profile m1|m2|c68]
+Usage: build.sh <output-directory> [--profile m1|m2|c68|tab5]
 
 Requires IDF_PATH to point at the locked ESP-IDF checkout and idf.py to be
 available in that environment. The script only builds the ESP-IDF shim; it
@@ -30,7 +30,7 @@ while [[ $# -gt 0 ]]; do
 		*) usage; exit 2 ;;
 	esac
 done
-case "$profile" in m1|m2|c68) ;; *) echo "unsupported profile: $profile" >&2; exit 2 ;; esac
+case "$profile" in m1|m2|c68|tab5) ;; *) echo "unsupported profile: $profile" >&2; exit 2 ;; esac
 if [[ "${TSENS_ORACLE:-0}" == "1" && "$profile" != "c68" ]]; then
 	echo "TSENS_ORACLE requires the C68 single-core profile" >&2
 	exit 2
@@ -63,7 +63,7 @@ if [[ "$profile" == c68 ]]; then
 	project_dir=$c68_src
 fi
 export SDKCONFIG="${output}/sdkconfig"
-if [[ "$profile" == m2 || "$profile" == c68 ]]; then
+if [[ "$profile" == m2 || "$profile" == c68 || "$profile" == tab5 ]]; then
 	export SDKCONFIG_DEFAULTS="${project_dir}/sdkconfig.defaults;${project_dir}/sdkconfig-m2.defaults"
 else
 	export SDKCONFIG_DEFAULTS="${project_dir}/sdkconfig.defaults"

@@ -1,3 +1,10 @@
+> **M5Stack Tab5 port — work in progress.**
+> This repository is the Tab5 port of
+> [m5stamp-p4-c6-linux](https://github.com/tsuyoshi-otake/m5stamp-p4-c6-linux)
+> (native RISC-V NOMMU Linux for M5Stack Stamp-P4 + Stamp-AddOn C6).
+> **Nothing below this banner has been validated on Tab5 hardware yet.**
+> The remainder of this README still describes the upstream Stamp-P4 project.
+
 # M5Stamp ESP32-P4 + C6 SDIO Linux (dual-core SMP)
 
 [![License](https://img.shields.io/badge/license-GPL--2.0--only-blue.svg)](LICENSE)

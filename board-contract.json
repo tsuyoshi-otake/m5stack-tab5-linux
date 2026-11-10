@@ -1,79 +1,121 @@
 {
   "schema": 1,
-  "board": "Stamp-P4 carrier Rev0.15 WIP",
-  "status": "hardware_contract_only",
-  "source_netlist": {
-    "file": "netlist.rev0.15.json",
-    "sha256": "0147005d05654388e8ee6c03f769d2cea2d518dd3e8c4f5f631e8433b50babbc",
-    "provenance": "Stamp-P4 Rev0.15 design export; supplied explicitly to tools/verify-board-contract.py and not stored in this repository."
+  "board": "M5Stack Tab5 (ESP32-P4 + ESP32-C6)",
+  "status": "hardware_contract_research_phase1",
+  "sources": {
+    "m5_docs": "docs.m5stack.com/en/core/Tab5 pin map + Tab5_v1r0 schematic",
+    "bsp": "m5stack/M5Tab5-UserDemo platforms/tab5/components/m5stack_tab5 + espressif/esp-bsp bsp/m5stack_tab5",
+    "stock_dump": "m5stack-tab5-linux-images/stock-2026-11-10 (SHA256SUMS.txt, boot-log.txt, live-log.txt, tab5-stock.bin; no extracted sdkconfig or usb-devices capture exists in this dump)",
+    "idf": "vendor/esp-idf esp32p4 register headers (rev 2c211b2, v5.5.3)"
   },
   "module": {
-    "part": "M5Stack Stamp-P4 / ESP32-P4NRW32",
+    "part": "ESP32-P4",
     "flash_bytes": 16777216,
     "psram_bytes": 33554432,
-    "capacity_source": "M5Stack Stamp-P4 documentation",
+    "capacity_source": "stock dump boot log",
     "assembled_revision_verified": true,
-    "observed_on": "2026-08-09",
-    "observed_source": "read-only serial capture on USB-C COM10; no flash write",
     "observed": {
-      "usb_device": "USB Serial Device / VID 303A PID 1001",
+      "usb_device": "USB Serial/JTAG, VID 303A PID 1001 (inferred: standard P4 USJ VID/PID seen at COM13 during earlier probing; the stock dump folder contains no usb-devices capture)",
       "rom": "esp32p4-eco2-20240710",
       "chip_revision": "v1.3",
-      "flash": { "bytes": 16777216, "mode": "DIO", "clock_hz": 80000000 },
-      "psram": { "bytes": 33554432, "density_mbit": 256, "memory_test": "OK" },
-      "running_image": "stampp4-factory-test",
-      "running_idf": "v5.4.2-dirty"
+      "crystal_hz": 40000000,
+      "flash": { "bytes": 16777216, "id": "0x46/0x4018" },
+      "psram": { "bytes": 33554432, "clock_hz": 200000000 },
+      "running_image": "m5stack_tab5 v639d9cc (ESP-IDF v5.4.2)"
     },
     "stock_readback": {
       "status": "complete_readonly_backup",
-      "tool": "esptool.py v4.8.1",
-      "size_bytes": 16777216,
-      "sha256": "229459f251eaf6222f0c07968702d72a3818e520da1788ce465027d969020c24",
-      "verification": "two independent full readbacks matched",
-      "notes": "esptool 5.3.1 lost the USB-Serial/JTAG response around 0x001AB000; use the pinned 4.8.1 recovery environment"
+      "location": "m5stack-tab5-linux-images/stock-2026-11-10",
+      "notes": "stock app brownouts on plain USB power once speaker amp + 100% backlight + C6 AP are up (BOD in live-log.txt); Linux boot keeps the amp off and backlight low"
     }
   },
   "download_control": {
-    "boot": { "net": "BOOT_GPIO35", "stamp_p4_pin": 36, "active_level": "low" },
-    "reset": { "net": "CHIP_EN", "stamp_p4_pin": 34, "active_level": "low" }
+    "boot": { "net": "BOOT", "gpio": 35, "active_level": "low" },
+    "reset": { "net": "CHIP_EN", "active_level": "low" }
   },
-  "usb_a_device": {
-    "controller": "USB1_FS_OTG",
-    "role": "device_only_on_this_carrier",
-    "d_plus_gpio": 27,
-    "d_minus_gpio": 26,
-    "d_plus_stamp_p4_pin": 17,
-    "d_minus_stamp_p4_pin": 19,
-    "vbus_stamp_p4_pin": 15,
-    "vbus_net": "USB_5V_PROTECTED",
-    "cdc_acm": "future_gadget_feature",
-    "host_role": "out_of_scope"
+  "internal_i2c": {
+    "sda_gpio": 31,
+    "scl_gpio": 32,
+    "speed_hz": 400000,
+    "scan_evidence": "boot-log.txt i2c probe lists 0x10 0x28 0x32 0x36 0x40 0x41 0x43 0x44 0x55 0x68 on the measured unit; 0x51 (RX8130 RTC) and 0x34 (TCA8418 keypad) were NOT present in that scan - the addresses below split observed vs inferred accordingly",
+    "devices": {
+      "0x10": "ES8388 audio codec (speaker path)",
+      "0x28": "unidentified (seen in stock scan)",
+      "0x32": "unidentified (seen in stock scan; possibly PMIC/charger, inferred)",
+      "0x36": "camera SCCB (SC202CS/SC2356, inferred)",
+      "0x40": "ES7210 4-mic ADC",
+      "0x41": "INA226 power monitor",
+      "0x43": "PI4IOE5V6408 IO expander 0",
+      "0x44": "PI4IOE5V6408 IO expander 1",
+      "0x55": "ST7123 touch",
+      "0x68": "BMI270 IMU",
+      "0x51": "RX8130 RTC (M5 docs; NOT in this unit's scan - inferred)",
+      "0x34": "TCA8418 keypad (keyboard units; NOT in this unit's scan - inferred)"
+    }
   },
-  "usb2_host": {
-    "d_plus_stamp_p4_pin": 40,
-    "d_minus_stamp_p4_pin": 41,
-    "carrier_status": "NC",
-    "host_role": "not_available_without_hardware_change"
+  "io_expander_0x43": {
+    "P0": { "function": "EXT_ANT_EN", "boot_state": "out 0 (internal antenna)" },
+    "P1": { "function": "SPK_EN", "boot_state": "out 0 (speaker amp OFF; stock drives 1)" },
+    "P2": { "function": "EXT5V_EN", "boot_state": "out 0 (off to save power; stock drives 1)" },
+    "P3": { "function": "reserved", "boot_state": "out 0" },
+    "P4": { "function": "LCD_RST", "boot_state": "latch 0, drive low ~10ms, release as input+pull-up" },
+    "P5": { "function": "TP_RST/TP_EN", "boot_state": "out 0 (touch held off at boot)" },
+    "P6": { "function": "CAM_RST", "boot_state": "out 0 (camera held off)" },
+    "P7": { "function": "headphone detect", "boot_state": "input" }
   },
-  "power": {
-    "usb_a_vbus": "protected_input_only",
-    "usb_a_and_usb_c_simultaneous_power": "prohibited",
-    "host_vbus_source": false
+  "io_expander_0x44": {
+    "P0": { "function": "WLAN_PWR_EN (C6 rail)", "boot_state": "out 1 (required: C6 off until set)" },
+    "P1": { "function": "input (inferred power-good)", "boot_state": "input Hi-Z" },
+    "P2": { "function": "input (inferred charge status)", "boot_state": "input Hi-Z" },
+    "P3": { "function": "USB5V_EN", "boot_state": "out 1" },
+    "P4": { "function": "PWROFF to PMIC", "boot_state": "out 0 (never pulse at boot)" },
+    "P5": { "function": "nCHG_QC_EN", "boot_state": "out 0 (QC on, stock parity)" },
+    "P6": { "function": "USB-C insert detect", "boot_state": "input" },
+    "P7": { "function": "CHG_EN", "boot_state": "out 1 (stock parity)" }
   },
-  "stamp_addon_c6_sdio": {
-    "status": "pin_contract_unverified_on_linux",
-    "reset_gpio": 42,
-    "clock_gpio": 43,
-    "command_gpio": 44,
-    "data_gpios": [45, 46, 47, 48],
-    "transport": "SDIO",
-    "linux_support": "M2_port_required"
+  "c6_sdio": {
+    "status": "research_validated_waiting_hardware",
+    "sdmmc_slot": 1,
+    "routing": "GPIO matrix (slot 0 has fixed GPIO39-44 pads and cannot route these pins)",
+    "clock_gpio": 12,
+    "command_gpio": 13,
+    "data_gpios": [11, 10, 9, 8],
+    "reset_gpio": 15,
+    "reset_polarity": "active-low pulse (C6 EN); released high, 1.5 s readiness wait",
+    "strap_gpio": 14,
+    "power": "expander 0x44 P0 WLAN_PWR_EN, reset-default OFF",
+    "transport": "SDIO 4-bit 40 MHz max (5 MHz Linux default as on Stamp)",
+    "firmware": "stock ships ESP-Hosted-MCU flavour; ESP-Hosted-NG network_adapter required and flashed via SDIO host_performs_slave_ota (linux/m2/ota-host, Tab5 sdkconfig variant)"
+  },
+  "display": {
+    "panel": "ST7123 on the measured unit (BSP also handles ST7121/ILI9881C)",
+    "resolution": "720x1280",
+    "dsi": "2 data lanes, 1000 Mbps default for ST7123 (965 Mbps is the BSP's ST7121 override), LDO_VO3 2500 mV for PHY",
+    "dpi": "RGB565, 70 MHz, hsync 2/40/40, vsync 2/8/220 (ST7123)",
+    "reset": "expander 0x43 P4 (open-drain style release)",
+    "backlight": "GPIO22, LEDC ch1 5 kHz; boot keeps ~12% duty",
+    "touch": "ST7123 I2C 0x55, INT GPIO23, TP_RST expander 0x43 P5"
+  },
+  "usb": {
+    "usb_c": "USB Serial/JTAG console (CDC-ACM + JTAG), VID 303A PID 1001",
+    "otg11_fs": "DWC @0x50040000 on internal FSLS PHY GPIO26/27 -- NOT wired to a connector on Tab5 (pins are I2S audio)",
+    "otg20_hs": "DWC2 @0x50000000, dedicated USB2.0 HS pads -> USB-A host port; 5V switch expander 0x44 P3"
+  },
+  "storage": {
+    "microsd": "SDMMC slot 0 dedicated pads CLK43 CMD44 D0-3=39-42, LDO_VO4 3.3V"
+  },
+  "audio": {
+    "i2s": "MCLK30 SCLK27 LRCK29 DOUT26 DIN28",
+    "codec_out": "ES8388 0x10",
+    "mic_adc": "ES7210 0x40",
+    "pa": "NS4150B via expander 0x43 P1 (kept off at boot)",
+    "note": "GPIO26/27 are I2S pins; they conflict with the OTG11 FS PHY, which is unused on Tab5"
   },
   "linux": {
-    "status": "not_implemented",
+    "status": "phase1_implementation_unflashed",
     "mmu": false,
-    "smp": false,
-    "flash_layout": "TBD_after_M0_measurement",
-    "dts": "TBD_after_M0_measurement"
+    "smp": "C68 dual-core path inherited from Stamp port",
+    "dts": "linux/dts/esp32p4-tab5.dts",
+    "board_selection": "ES_BOARD=tab5"
   }
 }
