@@ -1297,9 +1297,9 @@ else
 		exit 1
 	fi
 fi
-cat >"${dts_stage}/espressif/Makefile" <<'EOF'
+cat >"${dts_stage}/espressif/Makefile" <<EOF
 # SPDX-License-Identifier: GPL-2.0-only
-dtb-$(CONFIG_ARCH_ESPRESSIF) += ${dts_base}.dtb
+dtb-\$(CONFIG_ARCH_ESPRESSIF) += ${dts_base}.dtb
 EOF
 
 make_args=(
