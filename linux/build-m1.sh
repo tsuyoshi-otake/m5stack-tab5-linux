@@ -1113,8 +1113,21 @@ for patch_name in "${patches[@]}"; do
 		}
 	fi
 done
+# Tab5 board kernel patches (linux/tab5/*.patch) apply only to the
+# Tab5 kernel: the DSI-scanout GDMA re-arm driver and the simplefb
+# cache-flush ops are meaningless on Stamp boards and must not leak
+# into the shared patch stage.
+if [[ "${ES_BOARD:-stamp-p4}" == "tab5" ]]; then
+	tab5_patches=()
+	for p in "${script_dir}/tab5/"*.patch; do
+		[[ -f "$p" ]] || continue
+		cp -- "$p" "${patch_stage}/$(basename "$p")"
+		tab5_patches+=("$(basename "$p")")
+	done
+fi
 printf '%s\n' "why2025 reference commit: $(git -C "$why_root" rev-parse HEAD)" >"${patch_stage}/SOURCE.txt"
 printf '%s\n' "selected baseline patches: ${patches[*]}" >>"${patch_stage}/SOURCE.txt"
+printf '%s\n' "tab5 board patches: ${tab5_patches[*]:-none}" >>"${patch_stage}/SOURCE.txt"
 printf '%s\n' "sdio-default-mhz: ${sdio_default_mhz}" >>"${patch_stage}/SOURCE.txt"
 printf '%s\n' "wdt-test-timeout-s: ${wdt_test_timeout_s}" >>"${patch_stage}/SOURCE.txt"
 printf '%s\n' "wdt-test-no-feed: ${wdt_test_no_feed}" >>"${patch_stage}/SOURCE.txt"

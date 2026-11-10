@@ -79,5 +79,24 @@ else
 	echo "note: shellcheck not installed; skipped"
 fi
 
+# tab5_layout.h is the single source for the PSRAM windows the shim
+# must keep the framebuffer away from; every guarded region must appear
+# as a reserved-memory reg (or the Linux load addresses) in the Tab5
+# DTS so a layout change on one side cannot silently desync.
+layout="$root/linux/boot-shim/main/tab5_layout.h"
+dts="$root/linux/dts/esp32p4-tab5.dts"
+if [ -f "$layout" ] && [ -f "$dts" ]; then
+	grep -oE '\{ 0x[0-9a-fA-F]+u, 0x[0-9a-fA-F]+u \}' "$layout" | \
+	while read -r _ a s _; do
+		addr=${a%u,}; size=${s%u}
+		grep -q "reg = <$addr $size>" "$dts" && continue
+		# The kernel/DTB load windows are not reserved-memory nodes;
+		# they live at the memory-node base instead.
+		[ "$addr" = "0x48000000" ] || [ "$addr" = "0x48800000" ] && continue
+		echo "FAIL tab5_layout.h region $addr+$size missing from Tab5 DTS reserved-memory"
+		exit 1
+	done || fail=1
+fi
+
 [ "$fail" -eq 0 ] && echo "static checks passed"
 exit "$fail"

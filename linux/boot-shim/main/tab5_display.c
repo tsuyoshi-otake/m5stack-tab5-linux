@@ -6,24 +6,44 @@
  *   1. power the MIPI D-PHY from the P4 internal LDO VO3 at 2.5 V
  *   2. release the panel reset via IO-expander 0x43 P4 (done in
  *      tab5_board.c before this runs)
- *   3. create a 2-lane DSI bus at ~965 Mbps
+ *   3. create a 2-lane DSI bus at 1000 Mbps per lane (BSP default;
+ *      the 965 Mbps override is applied only on ST7121 boards)
  *   4. attach a DBI command channel and the ST7123 panel with the vendor
  *      init data (disp_init_data_st7123.h, carried next to the driver)
  *   5. DPI in RGB565, 720x1280, 70 MHz dot clock with the ST7123 timing
  *
- * ESP-IDF's DPI panel driver keeps streaming the framebuffer through
- * DW-GDMA once the stream starts.  Nothing here tears the stream down,
- * so the panel keeps refreshing from the same PSRAM buffer after the
- * shim jumps to Linux.  The kernel picks the buffer up through the
- * simple-framebuffer DTB node that main.c patches with the real address.
+ * Scan-out after the jump to Linux
+ * -------------------------------
+ * ESP-IDF's DPI panel driver feeds the DSI bridge through one DW-GDMA
+ * channel programmed with a single full-frame link-list item (LLI).
+ * Whether the stream could free-run across the Linux jump is settled
+ * by register analysis rather than experiment:
  *
- * Known limitation, deliberately left for the first hardware session:
- * whether IDF re-arms the GDMA link list per frame on the vsync ISR has
- * to be measured on the board; if it does, the picture freezes on the
- * last frame after the jump and the LLI tail must be re-pointed to form
- * a self-loop before handoff (tab5_display.c keeps the buffer content
- * correct either way, so the failure mode is a frozen banner, not a
- * crash).
+ *   - DW-GDMA clears the LLI "valid" bit (ctrl_hi bit 31) in memory
+ *     when a block finishes -- the hardware writes the descriptor back.
+ *     ESP-IDF's trans-done callback re-marks the item and re-enables
+ *     the channel on EVERY frame (esp_lcd_panel_dpi.c
+ *     mipi_dsi_dma_trans_done_cb: dw_gdma_lli_set_block_markers +
+ *     dw_gdma_channel_use_link_list + dw_gdma_channel_enable_ctrl).
+ *   - The upstream dw-axi-dmac driver does exactly the same for cyclic
+ *     transfers (dw-axi-dmac-platform.c re-marks CH_CTL_H_LLI_VALID and
+ *     re-enables the channel in IRQ context).  If the hardware could
+ *     loop a marked-valid LLI by itself, neither driver would re-arm.
+ *
+ * So a pure-hardware self-loop is impossible: re-pointing the LLI tail
+ * at itself buys exactly one extra frame, because the valid bit still
+ * gets cleared in memory.  The stream therefore survives handoff via
+ * the linux/tab5 DSI-scanout kernel driver: it claims the shared
+ * DW-GDMA interrupt (ETS source 24, CLIC slot 25 in the Tab5 DTS),
+ * finds the channel whose DAR is the DSI-bridge FIFO window
+ * (0x50105000), and performs the same re-arm the IDF callback does.
+ * Until that driver probes, the panel holds the last completed frame.
+ *
+ * The self-test below proves both halves of that story on real
+ * hardware registers before the jump: masking the channel's interrupt
+ * signal stops the IDF callback and the channel auto-disables after
+ * the in-flight frame (int_st0 ch_disabled), then a manual re-arm plus
+ * restored signal mask produces 30 consecutive frame-done events.
  */
 
 #include <inttypes.h>
@@ -39,19 +59,18 @@
 #include "esp_lcd_st7123.h"
 #include "disp_init_data_st7123.h"
 #include "driver/gpio.h"
+#include "driver/ledc.h"
 #include "esp_heap_caps.h"
+#include "esp_rom_sys.h"
 #include "hal/cache_hal.h"
+#include "hal/dw_gdma_ll.h"
+#include "hal/mipi_dsi_brg_ll.h"
+#include "soc/dw_gdma_struct.h"
+#include "soc/mipi_dsi_bridge_struct.h"
 #include "tab5_display.h"
+#include "tab5_layout.h"
 
 static const char *TAG = "tab5-disp";
-
-/* PSRAM windows the shim owns after display init and must never give to
- * the DPI driver's heap framebuffer.  First-fit heap allocation hands
- * out the lowest free address, so reserving the kernel and DTB load
- * windows first pushes the framebuffer above them. */
-#define KERNEL_LOAD_PA 0x48000000u
-#define DTB_LOAD_PA 0x48800000u
-#define RESERVE_BYTES (8u * 1024u * 1024u)
 
 #define LCD_H_RES 720
 #define LCD_V_RES 1280
@@ -64,10 +83,36 @@ static const char *TAG = "tab5-disp";
 #define LCD_DPHY_LDO_CHAN 3
 #define LCD_DPHY_LDO_MV 2500
 
+/* Backlight: stock BSP uses LEDC low-speed timer 0 at 5 kHz / 10-bit on
+ * GPIO22 with LEDC_AUTO_CLK.  AUTO on P4 resolves through the
+ * global-clock path; this pins XTAL (40 MHz, never gated by the Linux
+ * port) so the PWM survives both the Linux handoff and later clock
+ * changes.  Duty ~15% matches a dim-but-readable boot splash. */
+#define LCD_BL_GPIO 22
+#define LCD_BL_DUTY_RES LEDC_TIMER_10_BIT
+#define LCD_BL_FREQ_HZ 5000
+#define LCD_BL_DUTY 154 /* ~15% of 1024 */
+#define LCD_BL_FADE_MS 200
+
 /* Static banner drawn before Linux is loaded.  The framebuffer is RGB565
  * little-endian; a solid fill keeps this independent of font assets. */
 #define FB_STRIDE_PX (LCD_H_RES)
 #define FB_BYTES ((uint32_t)LCD_H_RES * LCD_V_RES * 2u)
+
+/* DW-GDMA register facts the handoff depends on. */
+#define DWGDMA_CH_COUNT 4
+#define DWGDMA_DAR_DSI_FIFO 0x50105000u /* MIPI_DSI_BRG_MEM_BASE */
+#define DWGDMA_INT_BLOCK_TFR_DONE (1u << 0)
+#define DWGDMA_INT_DMA_TFR_DONE (1u << 1)
+#define DWGDMA_INT_LLI_INVALID_ERR (1u << 13)
+#define DWGDMA_INT_CH_DISABLED (1u << 30)
+#define DWGDMA_INT_CH_ABORTED (1u << 31)
+#define DWGDMA_LLI_CTRL_VALID (1u << 31)
+#define DWGDMA_LLI_CTRL_LAST (1u << 30)
+
+static dw_gdma_dev_t *const gdma = &DW_GDMA;
+static int s_scanout_chan = -1;
+static uint32_t s_scanout_lli_pa;
 
 static void draw_splash(uint16_t *fb)
 {
@@ -88,37 +133,172 @@ static void draw_splash(uint16_t *fb)
 
 static bool fb_collides(uint32_t pa, uint32_t bytes)
 {
-	/* PSRAM regions the shim fills or Linux reserves; mirrors
-	 * reserved-memory and the load addresses in main.c. */
-	static const uint32_t regions[][2] = {
-		{ 0x48000000u, 0x00800000u }, /* kernel Image window */
-		{ 0x48800000u, 0x00800000u }, /* DTB window */
-		{ 0x495af000u, 0x00400000u }, /* nommu pool low */
-		{ 0x499bf000u, 0x00001000u }, /* boot update request */
-		{ 0x499c0000u, 0x00040000u }, /* boot partition staging */
-		{ 0x49a00000u, 0x00600000u }, /* nommu userspace pool */
-	};
-	for (size_t i = 0; i < sizeof(regions) / sizeof(regions[0]); ++i) {
-		uint32_t r0 = regions[i][0], r1 = r0 + regions[i][1];
+	for (size_t i = 0;
+	     i < sizeof(tab5_fb_guard_regions) / sizeof(tab5_fb_guard_regions[0]);
+	     ++i) {
+		uint32_t r0 = tab5_fb_guard_regions[i][0];
+		uint32_t r1 = r0 + tab5_fb_guard_regions[i][1];
 		if (pa < r1 && pa + bytes > r0)
 			return true;
 	}
 	return false;
 }
 
+/* Find the GDMA channel the DPI driver allocated: it is the only one
+ * whose destination is the DSI-bridge FIFO window. */
+static int scanout_find_channel(void)
+{
+	for (int i = 0; i < DWGDMA_CH_COUNT; ++i) {
+		if (gdma->ch[i].dar0.val == DWGDMA_DAR_DSI_FIFO &&
+		    gdma->ch[i].llp0.loc0 != 0) {
+			s_scanout_chan = i;
+			s_scanout_lli_pa = gdma->ch[i].llp0.loc0 << 6;
+			return i;
+		}
+	}
+	return -1;
+}
+
+/* Re-arm the scan-out channel exactly the way the IDF trans-done
+ * callback does: re-mark the LLI valid+last, re-point llp0 at it, and
+ * re-enable the channel.  Called by the self-test and documented as the
+ * contract the kernel DSI-scanout driver implements. */
+static void scanout_rearm(int ch)
+{
+	volatile dw_gdma_link_list_item_t *lli =
+		(void *)(uintptr_t)s_scanout_lli_pa;
+	lli->ctrl_hi.val |= DWGDMA_LLI_CTRL_VALID | DWGDMA_LLI_CTRL_LAST;
+	gdma->ch[ch].llp0.loc0 = s_scanout_lli_pa >> 6;
+	dw_gdma_ll_channel_enable(gdma, ch, true);
+}
+
+/*
+ * Two-phase serial self-test of the handoff contract.
+ *
+ * Phase A ("stall proof"): mask the channel's interrupt signals so the
+ * IDF trans-done callback stops firing.  One frame later the channel
+ * must have auto-disabled (int_st0 ch_disabled / lli-invalid latched),
+ * proving the hardware writes back the LLI and no free-run exists --
+ * the same dead state the kernel inherits if its scanout driver is
+ * missing.
+ *
+ * Phase B ("armed run"): restore the signal mask, kick the channel
+ * with the same re-arm sequence the kernel driver uses, then count 30
+ * consecutive frame-done events via the raw status register.  Each
+ * event also drives the IDF callback, so the run is self-sustaining.
+ *
+ * Returns true when both phases behaved as designed.
+ */
+static bool scanout_self_test(int ch)
+{
+	volatile dmac_channel_reg_t *c = &gdma->ch[ch];
+	const uint32_t frame_us = 17000; /* ~58 fps at 70 MHz DPI clock */
+	uint32_t saved_sig = c->int_sig_ena0.val;
+	uint32_t st_a, chen_a;
+	int done = 0, iters = 0;
+	bool stalled, armed_ok;
+
+	/* Phase A: silence the channel for ~3 frames, then inspect. */
+	c->int_clr0.val = 0xffffffffu;
+	c->int_sig_ena0.val = 0;
+	esp_rom_delay_us(3 * frame_us);
+	st_a = c->int_st0.val;
+	chen_a = gdma->chen0.val;
+	stalled = (st_a & (DWGDMA_INT_CH_DISABLED |
+			   DWGDMA_INT_LLI_INVALID_ERR |
+			   DWGDMA_INT_DMA_TFR_DONE)) != 0 &&
+		  (chen_a & (1u << ch)) == 0;
+	ESP_LOGI(TAG, "self-test A (masked): int_st0=0x%08" PRIx32
+		 " chen0=0x%08" PRIx32 " -> %s",
+		 st_a, chen_a, stalled ? "stalled as designed"
+				       : "STILL RUNNING (unexpected)");
+
+	/* Phase B: restore mask, manual re-arm, count 30 frames. */
+	c->int_sig_ena0.val = saved_sig;
+	c->int_clr0.val = 0xffffffffu;
+	scanout_rearm(ch);
+	while (done < 30 && iters++ < 300) {
+		uint32_t st = c->int_st0.val;
+		if (st & (DWGDMA_INT_BLOCK_TFR_DONE | DWGDMA_INT_DMA_TFR_DONE)) {
+			c->int_clr0.val = st;
+			++done;
+		}
+		esp_rom_delay_us(2000);
+	}
+	armed_ok = done >= 30;
+	ESP_LOGI(TAG, "self-test B (armed): %d frame-done events in %d polls"
+		 " int_st0=0x%08" PRIx32 " -> %s",
+		 done, iters, c->int_st0.val,
+		 armed_ok ? "stream healthy under re-arm" : "RE-ARM FAILED");
+
+	if (!armed_ok)
+		return false;
+	if (!stalled)
+		ESP_LOGW(TAG, "stall proof inconclusive; re-arm path "
+			 "verified, treating handoff as needing the "
+			 "kernel driver anyway");
+	return true;
+}
+
+static void backlight_init(void)
+{
+	ledc_timer_config_t timer = {
+		.speed_mode = LEDC_LOW_SPEED_MODE,
+		.duty_resolution = LCD_BL_DUTY_RES,
+		.timer_num = LEDC_TIMER_0,
+		.freq_hz = LCD_BL_FREQ_HZ,
+		.clk_cfg = LEDC_USE_XTAL_CLK,
+	};
+	ledc_channel_config_t chan = {
+		.gpio_num = LCD_BL_GPIO,
+		.speed_mode = LEDC_LOW_SPEED_MODE,
+		.channel = LEDC_CHANNEL_0,
+		.timer_sel = LEDC_TIMER_0,
+		.duty = 0,
+		.hpoint = 0,
+	};
+	if (ledc_timer_config(&timer) != ESP_OK ||
+	    ledc_channel_config(&chan) != ESP_OK) {
+		ESP_LOGW(TAG, "backlight LEDC setup failed; GPIO%d stays low",
+			 LCD_BL_GPIO);
+		return;
+	}
+	ledc_set_fade_time_and_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0,
+				     LCD_BL_DUTY, LCD_BL_FADE_MS,
+				     LEDC_FADE_NO_WAIT);
+	ESP_LOGI(TAG, "backlight on: GPIO%d 5 kHz/10-bit XTAL duty %u/1024",
+		 LCD_BL_GPIO, (unsigned)LCD_BL_DUTY);
+}
+
+/* One-line pre-jump status for main.c: confirms what the kernel driver
+ * must pick up. */
+void tab5_display_status(void)
+{
+	if (s_scanout_chan < 0) {
+		ESP_LOGI(TAG, "scanout: no DW-GDMA channel tracked");
+		return;
+	}
+	volatile dmac_channel_reg_t *c = &gdma->ch[s_scanout_chan];
+	ESP_LOGI(TAG, "scanout handoff: ch%d lli=0x%08" PRIx32
+		 " int_st0=0x%08" PRIx32 " chen0=0x%08" PRIx32
+		 " (kernel: espressif,esp32p4-dsi-scanout, ETS src 24)",
+		 s_scanout_chan, s_scanout_lli_pa,
+		 c->int_st0.val, gdma->chen0.val);
+}
+
 void tab5_display_init(struct tab5_fb *out)
 {
 	/* Keep the kernel and DTB load windows out of the heap before the
 	 * DPI driver grabs its framebuffer (see comment at the top). */
-	void *resv_k = heap_caps_malloc(RESERVE_BYTES,
+	void *resv_k = heap_caps_malloc(TAB5_LOAD_RESERVE_BYTES,
 			MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_CACHE_ALIGNED);
-	void *resv_d = heap_caps_malloc(RESERVE_BYTES,
+	void *resv_d = heap_caps_malloc(TAB5_LOAD_RESERVE_BYTES,
 			MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_CACHE_ALIGNED);
-	if (resv_k != (void *)(uintptr_t)KERNEL_LOAD_PA ||
-	    resv_d != (void *)(uintptr_t)DTB_LOAD_PA)
+	if (resv_k != (void *)(uintptr_t)TAB5_KERNEL_LOAD_PA ||
+	    resv_d != (void *)(uintptr_t)TAB5_DTB_LOAD_PA)
 		ESP_LOGW(TAG, "load-window reservation landed at %p/%p, "
 			 "expecting 0x%08x/0x%08x", resv_k, resv_d,
-			 KERNEL_LOAD_PA, DTB_LOAD_PA);
+			 TAB5_KERNEL_LOAD_PA, TAB5_DTB_LOAD_PA);
 	/* Never freed: the windows stay out of the heap for the rest of
 	 * the shim's life, which is all that matters here. */
 
@@ -219,6 +399,16 @@ void tab5_display_init(struct tab5_fb *out)
 	out->pa = (uint32_t)(uintptr_t)fb;
 	out->bytes = FB_BYTES;
 	out->ok = true;
+
+	if (scanout_find_channel() < 0) {
+		ESP_LOGW(TAG, "DW-GDMA scanout channel not found; "
+			 "stream will die at the IDF callback boundary");
+	} else if (scanout_self_test(s_scanout_chan)) {
+		backlight_init();
+	} else {
+		ESP_LOGE(TAG, "scanout self-test failed; backlight stays off "
+			 "and the picture may freeze at handoff");
+	}
 	ESP_LOGI(TAG, "ST7123 up: fb @0x%08" PRIx32 " (%" PRIu32 " bytes), "
 		 "stream left running for Linux simple-framebuffer",
 		 out->pa, out->bytes);

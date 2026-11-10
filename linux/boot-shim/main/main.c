@@ -63,6 +63,7 @@
 
 #ifdef BOARD_TAB5
 #include "tab5_board.h"
+#include "tab5_display.h"
 #endif
 
 #include "hal/usb_wrap_ll.h"
@@ -879,6 +880,8 @@ void app_main(void)
 	if (s_tab5_fb.ok &&
 	    !patch_display_window(dtb, total, s_tab5_fb.pa, s_tab5_fb.bytes))
 		ESP_LOGW(TAG, "display DTB patch failed; Linux boots headless");
+	if (s_tab5_fb.ok)
+		tab5_display_status();
 #endif
 	cache_hal_writeback_addr(DTB_LOAD_PA, total);
 

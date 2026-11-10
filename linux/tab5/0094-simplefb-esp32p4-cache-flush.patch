@@ -1,0 +1,85 @@
+From: Tab5 bring-up
+Subject: [PATCH] simplefb: optional espressif,flush-cache writeback
+
+The Tab5 boot shim hands a live DPI/DW-GDMA scan-out stream to Linux
+through a simple-framebuffer node.  The GDMA reader does not snoop the
+CPU data cache, so cfb console output needs an explicit writeback or
+the panel shows stale/torn pixels.  The node carries
+`espressif,flush-cache`; when present, wrap the draw ops with
+dma_sync_single_for_device -- the same non-coherent primitive the
+dw-mmc IDMAC patches use.
+
+Only staged for ES_BOARD=tab5 builds (linux/build-m1.sh).
+
+--- a/drivers/video/fbdev/simplefb.c
++++ b/drivers/video/fbdev/simplefb.c
+@@ -16,4 +16,5 @@
+ #include <linux/clk.h>
+ #include <linux/errno.h>
++#include <linux/dma-mapping.h>
+ #include <linux/fb.h>
+ #include <linux/io.h>
+@@ -110,6 +111,36 @@ static void simplefb_destroy(struct fb_info
+ 	if (mem)
+ 		release_mem_region(mem->start, resource_size(mem));
+ }
++
++/*
++ * espressif,flush-cache: the framebuffer memory is read by a DMA
++ * master (Tab5's DPI/DW-GDMA stream handed over from the boot shim)
++ * that does not snoop the CPU data cache.  Write back after every cfb
++ * operation so console output reaches the panel.
++ */
++static void simplefb_flush_cache(struct fb_info *info)
++{
++	dma_sync_single_for_device(info->device, info->fix.smem_start,
++				   info->fix.smem_len, DMA_TO_DEVICE);
++}
++
++static void simplefb_fillrect_flush(struct fb_info *info, const struct fb_fillrect *rect)
++{
++	cfb_fillrect(info, rect);
++	simplefb_flush_cache(info);
++}
++
++static void simplefb_copyarea_flush(struct fb_info *info, const struct fb_copyarea *area)
++{
++	cfb_copyarea(info, area);
++	simplefb_flush_cache(info);
++}
++
++static void simplefb_imageblit_flush(struct fb_info *info, const struct fb_image *image)
++{
++	cfb_imageblit(info, image);
++	simplefb_flush_cache(info);
++}
+ 
+ static const struct fb_ops simplefb_ops = {
+ 	.owner		= THIS_MODULE,
+@@ -119,6 +148,17 @@ static const struct fb_ops simplefb_ops =
+ 	.fb_setcolreg	= simplefb_setcolreg,
+ };
+ 
++static const struct fb_ops simplefb_flush_ops = {
++	.owner		= THIS_MODULE,
++	__FB_DEFAULT_IOMEM_OPS_RDWR,
++	__FB_DEFAULT_IOMEM_OPS_MMAP,
++	.fb_destroy	= simplefb_destroy,
++	.fb_setcolreg	= simplefb_setcolreg,
++	.fb_fillrect	= simplefb_fillrect_flush,
++	.fb_copyarea	= simplefb_copyarea_flush,
++	.fb_imageblit	= simplefb_imageblit_flush,
++};
++
+ static struct simplefb_format simplefb_formats[] = SIMPLEFB_FORMATS;
+ 
+ struct simplefb_params {
+@@ -600,6 +639,8 @@ static int simplefb_probe(struct platform_
+ 	par->size = info->fix.smem_len;
+ 
+ 	info->fbops = &simplefb_ops;
++	if (of_property_read_bool(pdev->dev.of_node, "espressif,flush-cache"))
++		info->fbops = &simplefb_flush_ops;
+ 	info->screen_base = ioremap_wc(info->fix.smem_start,
+ 				       info->fix.smem_len);
+ 	if (!info->screen_base) {

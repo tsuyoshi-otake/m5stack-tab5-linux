@@ -1,0 +1,218 @@
+From: Tab5 bring-up
+Subject: [PATCH] misc: esp32p4-dsi-scanout DW-GDMA re-arm driver
+
+The Tab5 boot shim starts the ESP-IDF MIPI-DSI DPI stream before
+jumping to Linux.  The stream uses one DW-GDMA channel with a single
+full-frame link-list item; the hardware clears the LLI valid bit in
+memory on every block end, so the stream stalls exactly one frame
+after the last software re-arm.  ESP-IDF re-arms from its trans-done
+interrupt callback (esp_lcd_panel_dpi.c mipi_dsi_dma_trans_done_cb);
+upstream dw-axi-dmac does the same for cyclic transfers
+(dw-axi-dmac-platform.c re-marks CH_CTL_H_LLI_VALID and re-enables the
+channel in IRQ context).  This driver performs the identical re-arm on
+the shared DW-GDMA interrupt so the panel keeps refreshing the
+handed-over framebuffer.
+
+Every re-arm restarts the block at the LLI start -- the framebuffer
+base -- so scan-out always resumes on a frame boundary and an in-flight
+DSI-bridge underrun corrupts at most the interrupted frame.
+
+Channel discovery is by destination address (DAR == 0x50105000, the
+MIPI_DSI_BRG_MEM_BASE FIFO window) rather than a fixed channel number,
+matching how the IDF allocator handed the channel out.  Probing also
+does one explicit re-arm: the channel is always stalled by the time
+this driver loads because the IDF ISR died with the shim.
+
+Only staged for ES_BOARD=tab5 builds (linux/build-m1.sh).
+
+--- /dev/null
++++ b/drivers/misc/esp32p4_dsi_scanout.c
+@@ -0,0 +1,181 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * ESP32-P4 DSI scan-out keeper: re-arm the DW-GDMA channel that the
++ * boot shim left streaming framebuffer pixels into the MIPI-DSI
++ * bridge FIFO.
++ *
++ * The hardware clears the LLI valid bit (ctrl_hi bit31) on every
++ * block end, so this is the IRQ-context equivalent of the ESP-IDF
++ * mipi_dsi_dma_trans_done_cb sequence:
++ *   dw_gdma_lli_set_block_markers (valid|last)
++ *   dw_gdma_channel_use_link_list (re-point llp0)
++ *   dw_gdma_channel_enable_ctrl (chen0 write-enable+enable)
++ */
++
++#include <linux/bitops.h>
++#include <linux/io.h>
++#include <linux/interrupt.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++
++/* DW-GDMA register layout (soc/dw_gdma_struct.h, hw_ver3):
++ * device header 0x000-0x0ff, channel i registers at 0x100+i*0x100. */
++#define DWGDMA_CHEN0		0x18
++#define DWGDMA_CH_BASE		0x100
++#define DWGDMA_CH_STRIDE	0x100
++#define DWGDMA_CH_COUNT		4
++
++/* Offsets within a channel register block. */
++#define DWGDMA_CH_SAR0		0x00
++#define DWGDMA_CH_DAR0		0x08
++#define DWGDMA_CH_LLP0		0x28
++#define DWGDMA_CH_INT_ST0	0x88
++#define DWGDMA_CH_INT_CLR0	0x98
++
++/* chen0 bit layout: low bits = channel enables, +8 = write-enable for
++ * the enable bit (0x101<<ch sets ch enable atomically). */
++#define DWGDMA_CHEN_WR_EN(ch)	(0x101u << (ch))
++
++/* llp0 register: loc0 occupies bits [29:0] (64-byte-aligned address
++ * >> 6); top bits carry the link-list master port -- preserved. */
++#define DWGDMA_LLP0_LOC_MASK	0x3fffffffu
++
++/* LLI memory layout (dw_gdma_link_list_item_t, 64 bytes): ctrl_hi at
++ * offset 0x24 holds the valid (31) and last-block (30) markers. */
++#define DWGDMA_LLI_CTRL_HI	0x24
++#define DWGDMA_LLI_VALID	BIT(31)
++#define DWGDMA_LLI_LAST		BIT(30)
++
++/* Channel int_st0 bits that require a re-arm: block done, transfer
++ * done, shadowreg/LLI-invalid error, channel auto-disabled (the normal
++ * end-of-list state on this single-LLI stream). */
++#define DWGDMA_INT_REARM	(BIT(0) | BIT(1) | BIT(13) | BIT(30))
++/* Genuine error bits, logged ratelimited. */
++#define DWGDMA_INT_ERRORS	(BIT(5) | BIT(6) | BIT(7) | BIT(8) | \
++				 BIT(9) | BIT(10) | BIT(11) | BIT(12) | \
++				 BIT(14) | BIT(16) | BIT(17) | BIT(18) | \
++				 BIT(19) | BIT(20) | BIT(21) | BIT(25) | \
++				 BIT(31))
++
++#define DSI_BRG_FIFO_PA		0x50105000 /* MIPI_DSI_BRG_MEM_BASE */
++
++struct dsi_scanout {
++	void __iomem *regs;
++	void __iomem *lli;
++	phys_addr_t lli_pa;
++	u32 ch_off;
++	int chan;
++	struct device *dev;
++};
++
++static void dsi_scanout_rearm(struct dsi_scanout *s)
++{
++	u32 llp;
++
++	/* Re-mark the in-memory LLI: valid + last (is_last so every
++	 * block is a whole frame and each re-arm resumes at the
++	 * framebuffer base -- a clean frame boundary). */
++	writel(readl(s->lli + DWGDMA_LLI_CTRL_HI) |
++		       DWGDMA_LLI_VALID | DWGDMA_LLI_LAST,
++	       s->lli + DWGDMA_LLI_CTRL_HI);
++	/* Re-point llp0 at the item, preserving the master-port bits. */
++	llp = readl(s->regs + s->ch_off + DWGDMA_CH_LLP0);
++	llp = (llp & ~DWGDMA_LLP0_LOC_MASK) |
++	      ((s->lli_pa >> 6) & DWGDMA_LLP0_LOC_MASK);
++	writel(llp, s->regs + s->ch_off + DWGDMA_CH_LLP0);
++	/* Re-enable the channel. */
++	writel(DWGDMA_CHEN_WR_EN(s->chan), s->regs + DWGDMA_CHEN0);
++}
++
++static irqreturn_t dsi_scanout_irq(int irq, void *arg)
++{
++	struct dsi_scanout *s = arg;
++	u32 st = readl(s->regs + s->ch_off + DWGDMA_CH_INT_ST0);
++
++	writel(st, s->regs + s->ch_off + DWGDMA_CH_INT_CLR0);
++	if (st & DWGDMA_INT_ERRORS)
++		dev_warn_ratelimited(s->dev,
++				     "dsi-scanout: GDMA ch%d error status 0x%08x\n",
++				     s->chan, st & DWGDMA_INT_ERRORS);
++	if (st & DWGDMA_INT_REARM)
++		dsi_scanout_rearm(s);
++	return IRQ_HANDLED;
++}
++
++static int dsi_scanout_probe(struct platform_device *pdev)
++{
++	struct dsi_scanout *s;
++	int i, irq, ret;
++
++	s = devm_kzalloc(&pdev->dev, sizeof(*s), GFP_KERNEL);
++	if (!s)
++		return -ENOMEM;
++	s->dev = &pdev->dev;
++	s->chan = -1;
++
++	s->regs = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(s->regs))
++		return PTR_ERR(s->regs);
++
++	/* The DPI stream's channel is the one whose destination is the
++	 * DSI-bridge FIFO window and which still points at its LLI. */
++	for (i = 0; i < DWGDMA_CH_COUNT; i++) {
++		u32 off = DWGDMA_CH_BASE + i * DWGDMA_CH_STRIDE;
++		u32 llp = readl(s->regs + off + DWGDMA_CH_LLP0);
++
++		if (readl(s->regs + off + DWGDMA_CH_DAR0) == DSI_BRG_FIFO_PA &&
++		    (llp & DWGDMA_LLP0_LOC_MASK) != 0) {
++			s->chan = i;
++			s->ch_off = off;
++			s->lli_pa = (llp & DWGDMA_LLP0_LOC_MASK) << 6;
++			break;
++		}
++	}
++	if (s->chan < 0) {
++		dev_warn(&pdev->dev,
++			 "no DW-GDMA channel streaming to the DSI bridge; nothing to keep alive\n");
++		return -ENODEV;
++	}
++
++	s->lli = ioremap(s->lli_pa, 64);
++	if (!s->lli)
++		return -ENOMEM;
++
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0)
++		return irq;
++	ret = devm_request_irq(&pdev->dev, irq, dsi_scanout_irq,
++			       IRQF_SHARED, dev_name(&pdev->dev), s);
++	if (ret)
++		return ret;
++
++	/* The channel is stalled by now (the IDF ISR died with the
++	 * shim): kick it once so scan-out resumes immediately. */
++	writel(0xffffffff, s->regs + s->ch_off + DWGDMA_CH_INT_CLR0);
++	dsi_scanout_rearm(s);
++
++	platform_set_drvdata(pdev, s);
++	dev_info(&pdev->dev,
++		 "keeping DSI scan-out alive: GDMA ch%d lli @0x%pa\n",
++		 s->chan, &s->lli_pa);
++	return 0;
++}
++
++static const struct of_device_id dsi_scanout_of_match[] = {
++	{ .compatible = "espressif,esp32p4-dsi-scanout" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, dsi_scanout_of_match);
++
++static struct platform_driver dsi_scanout_driver = {
++	.probe = dsi_scanout_probe,
++	.driver = {
++		.name = "esp32p4-dsi-scanout",
++		.of_match_table = dsi_scanout_of_match,
++	},
++};
++module_platform_driver(dsi_scanout_driver);
++
++MODULE_DESCRIPTION("ESP32-P4 DSI scan-out DW-GDMA re-arm keeper");
++MODULE_LICENSE("GPL");
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -74,3 +74,4 @@
+ obj-y				+= keba/
+ obj-y				+= amd-sbi/
+ obj-$(CONFIG_MISC_RP1)		+= rp1/
++obj-y				+= esp32p4_dsi_scanout.o
