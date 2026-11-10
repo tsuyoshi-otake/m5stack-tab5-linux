@@ -7,7 +7,14 @@
 #
 # The component compiles into nothing unless the shim is built for Tab5, so
 # the proven M1/M2/C68 shim images keep their exact dependency set.
-if("$ENV{BOOT_PROFILE}" STREQUAL "tab5")
+# Provenance: esp_lcd_st7123.[ch] are byte-identical to
+# m5stack/M5Tab5-UserDemo @ fe8aa051beb9385468f7e46b909e764169df3f7a
+# (platforms/tab5/components/m5stack_tab5, Apache-2.0) and
+# disp_init_data_st7123.h to espressif/esp-bsp @
+# 67f41a169401d1f23e827188dd08fb351cb0febe
+# (bsp/m5stack_tab5/priv_include/disp_init_data_1.h).  The vendored copies
+# here are the source of truth for this build.
+if("$ENV{ES_BOARD}" STREQUAL "tab5")
     idf_component_register(
         SRCS "esp_lcd_st7123.c"
         INCLUDE_DIRS "include"

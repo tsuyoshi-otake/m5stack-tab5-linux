@@ -1,16 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-only
 
-# Tab5-only requirements stay empty for every other profile, so M1/M2/C68
-# keep their exact link set.
-set(tab5_requires "")
-if("$ENV{BOOT_PROFILE}" STREQUAL "tab5")
-    set(tab5_requires esp_lcd esp_lcd_st7123 driver)
-endif()
-
+# No PRIV_REQUIRES: the main component keeps its automatic dependency on
+# every project component, which the Tab5 board layer (esp_lcd, the
+# i2c master driver) needs too.
 idf_component_register(
     SRCS "main.c" "m2_sdmmc.c" "c68_secondary_entry.S"
     INCLUDE_DIRS "."
-    PRIV_REQUIRES ${tab5_requires}
 )
 
 # Build identification (#22): the git revision is printed at boot.
@@ -19,18 +14,22 @@ if(DEFINED ENV{ES_GIT_REV} AND NOT "$ENV{ES_GIT_REV}" STREQUAL "")
 endif()
 
 # Keep M1's proven boot path free of SDIO side effects.  The M2 and C68
-# network builds opt in explicitly when they build this project.
-if("$ENV{BOOT_PROFILE}" STREQUAL "m2" OR
-   "$ENV{BOOT_PROFILE}" STREQUAL "c68")
+# network builds opt in explicitly when they build this project.  Tab5 is
+# a board, not a profile: under ES_BOARD=tab5 the tab5_board.c bootstrap
+# replaces m2_sdmmc.c entirely, in whichever profile is building.
+if(("$ENV{BOOT_PROFILE}" STREQUAL "m2" OR
+    "$ENV{BOOT_PROFILE}" STREQUAL "c68") AND
+   NOT "$ENV{ES_BOARD}" STREQUAL "tab5")
     target_compile_definitions(${COMPONENT_LIB} PRIVATE M2_SDIO=1)
 endif()
-# Tab5 is a different board, not an M-profile: it carries its own SDIO
-# route (GPIO8-13 + C6 reset GPIO15), two PI4IOE power expanders on the
-# internal I2C bus, and the ST7123 MIPI-DSI panel.  BOARD_TAB5 selects
-# tab5_board.c/tab5_display.c in main.c and drops the Stamp OTG and
-# GPIO42/43-48 paths entirely.
-if("$ENV{BOOT_PROFILE}" STREQUAL "tab5")
-    target_compile_definitions(${COMPONENT_LIB} PRIVATE BOARD_TAB5=1 UP_BOOT=1)
+# ES_BOARD=tab5 carries its own SDIO route (GPIO8-13 + C6 reset GPIO15),
+# two PI4IOE power expanders on the internal I2C bus, and the ST7123
+# MIPI-DSI panel.  BOARD_TAB5 selects tab5_board.c/tab5_display.c in
+# main.c and drops the Stamp OTG and GPIO42/43-48 paths entirely.  The
+# C68 profile keeps its normal SMP path: BOARD_TAB5 is deliberately not
+# tied to UP_BOOT.
+if("$ENV{ES_BOARD}" STREQUAL "tab5")
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE BOARD_TAB5=1)
     target_sources(${COMPONENT_LIB} PRIVATE "tab5_board.c" "tab5_display.c")
 endif()
 if("$ENV{C68_CLEAN_RELEASE}" STREQUAL "1")

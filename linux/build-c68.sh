@@ -53,6 +53,7 @@ command -v riscv32-esp-elf-nm >/dev/null || {
 }
 
 export C68_CLEAN_RELEASE=1
+echo "build-c68: ES_BOARD=${ES_BOARD:-stamp-p4}"
 "${shim_src}/build.sh" "$shim_out" --profile c68
 [[ -f "$elf" ]] || {
 	echo "C68_GATE_FAIL: missing $elf" >&2

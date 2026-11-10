@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-only
 /*
  * M5Stack Tab5 board bootstrap, called by the boot shim only when the shim
- * is built with BOOT_PROFILE=tab5 (CMake: BOARD_TAB5).  See
+ * is built with ES_BOARD=tab5 (CMake: BOARD_TAB5).  See
  * board-contract.json for the hardware sources behind every GPIO and
  * expander bit used here.
  */
@@ -26,3 +26,7 @@ struct tab5_fb {
  * non-fatal failures (e.g. display) so the serial recovery path stays.
  */
 void tab5_board_init(struct tab5_fb *fb);
+
+/* #56 deep-sleep hook: clear expander 0x44 P0 (the C6 rail) over the
+ * internal I2C bus; the Tab5 equivalent of the Stamp GPIO42 latch. */
+void tab5_c6_power_off(void);

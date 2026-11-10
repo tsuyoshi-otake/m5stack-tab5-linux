@@ -74,6 +74,9 @@
 #include "boot_ab.h"
 #include "deep_sleep.h"
 
+/* Tab5's FS OTG PHY shares the I2S audio pins and is not wired to a
+ * connector, so this is compiled out for BOARD_TAB5 (see the call site). */
+#ifndef BOARD_TAB5
 static void usb_otg_init(void)
 {
 	ESP_LOGI("otg", "enabling USB OTG 1.1 (FS GPIO26/27) clock and PHY...");
@@ -97,6 +100,7 @@ static void usb_otg_init(void)
 	USB_WRAP.otg_conf.dp_pullup = 0;
 	gpio_pullup_dis(GPIO_NUM_27);
 }
+#endif /* BOARD_TAB5 */
 
 static const char *TAG = "boot";
 

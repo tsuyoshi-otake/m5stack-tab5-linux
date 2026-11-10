@@ -325,6 +325,57 @@ static esp_err_t expanders_init(void)
 	return ESP_OK;
 }
 
+/*
+ * #56 hook: deep_sleep.c calls this where the Stamp board pulses the
+ * GPIO42 C6 latch.  The Tab5 C6 rail is expander 0x44 P0, reached over
+ * the internal I2C bus; the bus is brought up here because
+ * deep_sleep_early() runs before expanders_init().  P0 is cleared with a
+ * read-modify-write so the other rails keep their levels, and the bus is
+ * torn down again so expanders_init() can take it in the boot that did
+ * not sleep.  The next boot's expander init turns the rail back on.
+ */
+void tab5_c6_power_off(void)
+{
+	i2c_master_bus_handle_t bus = s_i2c_bus;
+	i2c_master_dev_handle_t dev = s_exp1;
+	uint8_t reg = PI4IO_REG_OUT_SET;
+	uint8_t out = 0;
+	bool own_bus = false;
+
+	if (!bus) {
+		i2c_master_bus_config_t bus_cfg = {
+			.clk_source = I2C_CLK_SRC_DEFAULT,
+			.i2c_port = TAB5_I2C_PORT,
+			.scl_io_num = TAB5_I2C_SCL_GPIO,
+			.sda_io_num = TAB5_I2C_SDA_GPIO,
+			.glitch_ignore_cnt = 7,
+			.flags.enable_internal_pullup = true,
+		};
+		i2c_device_config_t dev_cfg = {
+			.dev_addr_length = I2C_ADDR_BIT_LEN_7,
+			.device_address = EXPANDER1_ADDR,
+			.scl_speed_hz = TAB5_I2C_HZ,
+		};
+
+		if (i2c_new_master_bus(&bus_cfg, &bus) != ESP_OK ||
+		    i2c_master_bus_add_device(bus, &dev_cfg, &dev) != ESP_OK) {
+			ESP_LOGE(TAG, "c6 off: i2c bus failed");
+			return;
+		}
+		own_bus = true;
+	}
+	if (i2c_master_transmit_receive(dev, &reg, 1, &out, 1, 100) == ESP_OK &&
+	    expander_write(dev, PI4IO_REG_OUT_SET, out & ~0x01u) == ESP_OK)
+		ESP_LOGI(TAG, "c6 rail off (expander 0x44 P0)");
+	else
+		ESP_LOGE(TAG, "c6 off: expander write failed");
+
+	if (own_bus) {
+		i2c_master_bus_rm_device(dev);
+		i2c_del_master_bus(bus);
+	}
+}
+
 void tab5_board_init(struct tab5_fb *fb)
 {
 	fb->ok = false;
