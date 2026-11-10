@@ -8,9 +8,12 @@
 set -u
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-# The m3-lab image also carries the board overlay (sdio-diag).
+# The m3-lab image also carries the board overlays (sdio-diag).  Both the
+# Stamp and Tab5 overlays are scanned; shadowed-file handling below uses
+# the Stamp overlay path, which is the only one the release image ships.
 board="$root/linux/buildroot-external/board/stamp-p4/rootfs-overlay"
-scripts=$(find "$root/linux/m3-lab/rootfs-overlay" "$board" \
+boards="$board $root/linux/buildroot-external/board/tab5/rootfs-overlay"
+scripts=$(find "$root/linux/m3-lab/rootfs-overlay" $boards \
 	"$root/linux/m3-lab/post-build.sh" \
 	-type f \( -path '*/init.d/*' -o -path '*/usr/sbin/*' -o -path '*/default.script.d/*' \
 	-o -name post-build.sh \) 2>/dev/null)
