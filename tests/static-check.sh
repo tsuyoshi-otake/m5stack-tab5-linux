@@ -30,14 +30,16 @@ for f in $scripts; do
 	# post-build.sh runs on the build host and only lists applet names.
 	[ "${f##*/}" = post-build.sh ] && continue
 	# Board overlay files that m3-lab shadows, or that post-build deletes,
-	# never reach the image.
-	case "$f" in
-	"$board"/*)
-		rel=${f#"$board"/}
-		[ -e "$root/linux/m3-lab/rootfs-overlay/$rel" ] && continue
-		grep -q "TARGET_DIR}/$rel\"" "$root/linux/m3-lab/post-build.sh" && continue
-		;;
-	esac
+	# never reach the image.  Both board overlays get the same treatment.
+	for b in $boards; do
+		case "$f" in
+		"$b"/*)
+			rel=${f#"$b"/}
+			[ -e "$root/linux/m3-lab/rootfs-overlay/$rel" ] && continue 2
+			grep -q "TARGET_DIR}/$rel\"" "$root/linux/m3-lab/post-build.sh" && continue 2
+			;;
+		esac
+	done
 	for cmd in $missing; do
 		# Match the command in command position, ignoring comments.
 		if grep -v '^[[:space:]]*#' "$f" | grep -Eq "(^|[^A-Za-z0-9_./-])$cmd([[:space:];|&)]|$)"; then
