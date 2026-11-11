@@ -2190,7 +2190,12 @@ set_config_value "${br_output}/.config" BR2_LINUX_KERNEL_PATCH "\"${patch_stage}
 set_config_value "${br_output}/.config" BR2_LINUX_KERNEL_USE_CUSTOM_CONFIG y
 set_config_value "${br_output}/.config" BR2_LINUX_KERNEL_CUSTOM_CONFIG_FILE "\"${firmware_root}/linux/${kernel_config_src}\""
 set_config_value "${br_output}/.config" BR2_LINUX_KERNEL_DTS_SUPPORT y
-set_config_value "${br_output}/.config" BR2_LINUX_KERNEL_INTREE_DTS_NAME "\"${intree_dts}\""
+# No in-tree DTS name: the board DTB comes from the staged DTS directory
+# (BR2_LINUX_KERNEL_CUSTOM_DTS_DIR and its Makefile).  main wrote an
+# over-escaped name here that olddefconfig reset to "", so "" is what the
+# released Stamp images were built with; a real name such as
+# espressif/tab5 makes Buildroot ask for a .dtb that has no rule.
+set_config_value "${br_output}/.config" BR2_LINUX_KERNEL_INTREE_DTS_NAME '""'
 set_config_value "${br_output}/.config" BR2_LINUX_KERNEL_CUSTOM_DTS_PATH "# BR2_LINUX_KERNEL_CUSTOM_DTS_PATH is not set"
 set_config_value "${br_output}/.config" BR2_LINUX_KERNEL_CUSTOM_DTS_DIR "\"${dts_stage}\""
 set_config_value "${br_output}/.config" BR2_RISCV_USE_MMU "# BR2_RISCV_USE_MMU is not set"
