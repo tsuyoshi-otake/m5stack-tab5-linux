@@ -416,6 +416,21 @@ void tab5_display_init(struct tab5_fb *out)
 	out->bytes = FB_BYTES;
 	out->ok = true;
 
+	/* First-boot diagnostics: every channel's view, then again after a
+	 * pause with the load path still idle, to tell "stream dead" from
+	 * "stream killed by the kernel copy that follows". */
+	for (int pass = 0; pass < 2; ++pass) {
+		for (int i = 0; i < DWGDMA_CH_COUNT; ++i) {
+			volatile dmac_channel_reg_t *c = &gdma->ch[i];
+			ESP_LOGI(TAG, "diag%d ch%d: sar=0x%08" PRIx32 " dar=0x%08" PRIx32
+				 " llp=0x%08" PRIx32 " st=0x%08" PRIx32
+				 " sig=0x%08" PRIx32 " chen=0x%08" PRIx32,
+				 pass, i, c->sar0.val, c->dar0.val, c->llp0.val,
+				 c->int_st0.val, c->int_sig_ena0.val, gdma->chen0.val);
+		}
+		if (pass == 0)
+			esp_rom_delay_us(300000);
+	}
 	if (scanout_find_channel() < 0) {
 		ESP_LOGW(TAG, "DW-GDMA scanout channel not found; "
 			 "stream will die at the IDF callback boundary");
