@@ -14,7 +14,10 @@ param(
 
 	[switch] $AllowCandidateWrite,
 
-	[string] $ExpectedStockSha256 = "229459f251eaf6222f0c07968702d72a3818e520da1788ce465027d969020c24"
+	# SHA-256 of the Tab5's own stock 16 MiB readback (stock-2026-11-10/
+	# tab5-stock.bin).  The value this script inherited, 229459f2..., is the
+	# Stamp-P4 readback and would reject the Tab5 dump.
+	[string] $ExpectedStockSha256 = "a260eda93e4e5ddc1d3abddd361b1eb326c07d4248b67d1b493feba057fde231"
 )
 
 # This image is a temporary P4 host used only to migrate the C6 slave over the
