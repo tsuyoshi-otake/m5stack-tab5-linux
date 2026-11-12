@@ -254,35 +254,10 @@ static bool scanout_self_test(int ch)
 	wraps_a = gdma_sample_wraps(ch, 40, &moved_a);
 	uint32_t st_a = c->int_st0.val;
 	free_run = moved_a > 0;
-	uint32_t loop_moved = 0, loop_wraps = 0, loop_st = 0, loop_hi = 0;
 	if (!free_run && !(gdma->chen0.val & (1u << ch))) {
-		/* Experiment while stalled (registers writable, CPU interrupts
-		 * still off): link the item to itself and drop "last".  If the
-		 * hardware does not invalidate the item in memory, the stream
-		 * then loops with no software at all. */
-		volatile dw_gdma_link_list_item_t *lli =
-			(void *)CACHE_LL_L2MEM_NON_CACHE_ADDR(s_scanout_lli_pa);
-		uint32_t llp_saved = lli->llp_lo.val;
-		lli->llp_lo.loc0 = s_scanout_lli_pa >> 6;
-		lli->ctrl_hi.val = (lli->ctrl_hi.val | DWGDMA_LLI_CTRL_VALID) &
-				   ~DWGDMA_LLI_CTRL_LAST;
+		/* Stalled and disabled: safe to re-arm by hand. */
 		c->int_clr0.val = 0xffffffffu;
-		gdma->ch[ch].llp0.loc0 = s_scanout_lli_pa >> 6;
-		dw_gdma_ll_channel_enable(gdma, ch, true);
-		esp_rom_delay_us(6 * frame_us);
-		loop_wraps = gdma_sample_wraps(ch, 100, &loop_moved);
-		loop_st = c->int_st0.val;
-		loop_hi = lli->ctrl_hi.val;
-		/* Back to the IDF scheme: mark the item last again, let the
-		 * running pass end, then re-arm by hand. */
-		lli->ctrl_hi.val |= DWGDMA_LLI_CTRL_LAST;
-		lli->llp_lo.val = llp_saved;
-		for (int i = 0; i < 200 && (gdma->chen0.val & (1u << ch)); ++i)
-			esp_rom_delay_us(500);
-		if (!(gdma->chen0.val & (1u << ch))) {
-			c->int_clr0.val = 0xffffffffu;
-			scanout_rearm(ch);
-		}
+		scanout_rearm(ch);
 	}
 	if (mie)
 		RV_SET_CSR(mstatus, MSTATUS_MIE);
@@ -298,13 +273,6 @@ static bool scanout_self_test(int ch)
 	ESP_LOGI(TAG, "self-test A regs: st 0x%08" PRIx32 "->0x%08" PRIx32
 		 " sig 0x%08" PRIx32 " reads 0x%08" PRIx32 " after writing 0",
 		 st_before, st_a, saved_sig, sig_rb);
-	esp_rom_delay_us(20000);
-	ESP_LOGI(TAG, "self-test loop: moved=%" PRIu32 " wraps=%" PRIu32
-		 " in 100 ms st=0x%08" PRIx32 " lli.ctrl_hi=0x%08" PRIx32
-		 " chen=%d -> %s", loop_moved, loop_wraps, loop_st, loop_hi,
-		 (gdma->chen0.val & (1u << ch)) ? 1 : 0,
-		 loop_wraps >= 4 ? "SELF-LOOP RUNS WITHOUT SOFTWARE"
-				 : "self-loop does not hold");
 
 	wraps_b = gdma_sample_wraps(ch, 600, &moved_b);
 	bool ok = wraps_b >= 30;
