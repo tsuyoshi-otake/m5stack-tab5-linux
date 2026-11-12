@@ -51,6 +51,7 @@
 #include <stdbool.h>
 #include <string.h>
 
+#include "esp_attr.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_ldo_regulator.h"
@@ -115,6 +116,11 @@ static dw_gdma_dev_t *const gdma = &DW_GDMA;
 static int s_scanout_chan = -1;
 static uint32_t s_scanout_lli_pa;
 
+/* Kernel window + gap + DTB window, 16 MiB from the start of PSRAM. */
+static uint8_t s_load_windows[(TAB5_DTB_LOAD_PA - TAB5_KERNEL_LOAD_PA) +
+			      TAB5_LOAD_RESERVE_BYTES]
+	EXT_RAM_NOINIT_ATTR __attribute__((aligned(64)));
+
 static void draw_splash(uint16_t *fb)
 {
 	/* Dark blue field with a green "M5 Tab5 Linux" band: 5 horizontal
@@ -150,14 +156,28 @@ static bool fb_collides(uint32_t pa, uint32_t bytes)
 static int scanout_find_channel(void)
 {
 	for (int i = 0; i < DWGDMA_CH_COUNT; ++i) {
-		if (gdma->ch[i].dar0.val == DWGDMA_DAR_DSI_FIFO &&
-		    gdma->ch[i].llp0.loc0 != 0) {
+		if (gdma->ch[i].dar0.val == DWGDMA_DAR_DSI_FIFO) {
 			s_scanout_chan = i;
-			s_scanout_lli_pa = gdma->ch[i].llp0.loc0 << 6;
 			return i;
 		}
 	}
 	return -1;
+}
+
+/* The channel's llp0 reads 0 while the block runs (it holds the NEXT item),
+ * so the item is found by content instead: the one 64-byte-aligned record
+ * in internal RAM with sar == framebuffer and dar == the DSI FIFO. */
+#define SRAM_SCAN_LO 0x4ff00000u
+#define SRAM_SCAN_HI 0x4ff80000u
+static uint32_t scanout_find_lli(uint32_t fb_pa)
+{
+	for (uint32_t pa = SRAM_SCAN_LO; pa < SRAM_SCAN_HI; pa += 64) {
+		const volatile uint32_t *w = (const volatile uint32_t *)
+			CACHE_LL_L2MEM_NON_CACHE_ADDR(pa);
+		if (w[0] == fb_pa && w[2] == DWGDMA_DAR_DSI_FIFO)
+			return pa;
+	}
+	return 0;
 }
 
 /* Re-arm the scan-out channel exactly the way the IDF trans-done
@@ -291,32 +311,20 @@ void tab5_display_status(void)
 
 void tab5_display_init(struct tab5_fb *out)
 {
-	/* Keep the kernel and DTB load windows out of the heap before the
-	 * DPI driver grabs its framebuffer (see comment at the top). */
-	void *resv_k = heap_caps_malloc(TAB5_LOAD_RESERVE_BYTES,
-			MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_CACHE_ALIGNED);
-	void *resv_d = heap_caps_malloc(TAB5_LOAD_RESERVE_BYTES,
-			MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_CACHE_ALIGNED);
-	/* The PSRAM heap keeps its own metadata at the start of the region,
-	 * so a block lands a few dozen bytes above the window start.  That
-	 * is fine as long as it starts inside the first page: the shim never
-	 * touches the heap again after the framebuffer exists, and the
-	 * kernel/DTB copy overwrites the metadata only at the hand-off. */
-	if (!resv_k || !resv_d ||
-	    (uintptr_t)resv_k < TAB5_KERNEL_LOAD_PA ||
-	    (uintptr_t)resv_k >= TAB5_KERNEL_LOAD_PA + 0x1000u ||
-	    (uintptr_t)resv_d < TAB5_DTB_LOAD_PA ||
-	    (uintptr_t)resv_d >= TAB5_DTB_LOAD_PA + 0x1000u) {
-		ESP_LOGW(TAG, "load-window reservation landed at %p/%p, "
-			 "expecting 0x%08x/0x%08x; display skipped",
-			 resv_k, resv_d, TAB5_KERNEL_LOAD_PA, TAB5_DTB_LOAD_PA);
-		heap_caps_free(resv_d);
-		heap_caps_free(resv_k);
+	/* The kernel and DTB load windows are held by a linker-placed array at
+	 * the very start of PSRAM, so the PSRAM heap (and its metadata) begins
+	 * above them and nothing the shim allocates is ever overwritten by the
+	 * kernel/DTB copy.  Fail closed if the linker did not put it there. */
+	if ((uintptr_t)s_load_windows != TAB5_KERNEL_LOAD_PA ||
+	    sizeof(s_load_windows) < (TAB5_DTB_LOAD_PA - TAB5_KERNEL_LOAD_PA) +
+				     TAB5_LOAD_RESERVE_BYTES) {
+		ESP_LOGW(TAG, "load-window array at %p (%u bytes), expected 0x%08x; "
+			 "display skipped", s_load_windows,
+			 (unsigned)sizeof(s_load_windows), TAB5_KERNEL_LOAD_PA);
 		return;
 	}
-	ESP_LOGI(TAG, "load windows reserved at %p/%p", resv_k, resv_d);
-	/* Never freed: the windows stay out of the heap for the rest of
-	 * the shim's life, which is all that matters here. */
+	ESP_LOGI(TAG, "load windows held at %p (%u bytes)", s_load_windows,
+		 (unsigned)sizeof(s_load_windows));
 
 	esp_ldo_channel_handle_t ldo = NULL;
 	esp_lcd_dsi_bus_handle_t dsi = NULL;
@@ -431,8 +439,10 @@ void tab5_display_init(struct tab5_fb *out)
 		if (pass == 0)
 			esp_rom_delay_us(300000);
 	}
-	if (scanout_find_channel() < 0) {
-		ESP_LOGW(TAG, "DW-GDMA scanout channel not found; "
+	s_scanout_lli_pa = scanout_find_lli(out->pa);
+	ESP_LOGI(TAG, "scanout LLI at 0x%08" PRIx32, s_scanout_lli_pa);
+	if (scanout_find_channel() < 0 || !s_scanout_lli_pa) {
+		ESP_LOGW(TAG, "DW-GDMA scanout channel/LLI not found; "
 			 "stream will die at the IDF callback boundary");
 	} else if (scanout_self_test(s_scanout_chan)) {
 		backlight_init();
