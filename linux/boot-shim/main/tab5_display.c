@@ -63,6 +63,8 @@
 #include "driver/ledc.h"
 #include "esp_heap_caps.h"
 #include "esp_rom_sys.h"
+#include "riscv/csr.h"
+#include "riscv/rv_utils.h"
 #include "hal/cache_hal.h"
 #include "hal/cache_ll.h"
 #include "hal/dw_gdma_ll.h"
@@ -240,24 +242,37 @@ static bool scanout_self_test(int ch)
 	uint32_t moved_a, wraps_a, moved_b, wraps_b;
 	bool free_run;
 
-	c->int_sig_ena0.val = 0;
+	/* Phase A runs with CPU interrupts globally off (mstatus.MIE clear),
+	 * which is exactly the state after the jump to Linux: no ISR of any
+	 * kind can re-arm the channel.  Masking the channel's signal register
+	 * alone was not proof (its read-back is not what was written). */
+	uint32_t st_before = c->int_st0.val;
+	unsigned long mie = RV_CLEAR_CSR(mstatus, MSTATUS_MIE) & MSTATUS_MIE;
+	c->int_clr0.val = 0xffffffffu;
 	esp_rom_delay_us(4 * frame_us);
 	uint32_t chen_a = gdma->chen0.val & (1u << ch);
 	wraps_a = gdma_sample_wraps(ch, 40, &moved_a);
+	uint32_t st_a = c->int_st0.val;
 	free_run = moved_a > 0;
-	ESP_LOGI(TAG, "self-test A (ISR masked): chen=%d sar moved %" PRIu32
-		 " wraps %" PRIu32 " int_st0=0x%08" PRIx32 " -> %s",
-		 chen_a ? 1 : 0, moved_a, wraps_a, c->int_st0.val,
-		 free_run ? "HARDWARE FREE-RUN (no re-arm needed)"
-			  : "stalled (kernel keeper required)");
-
-	/* Restore the IDF callback; a stalled channel is disabled, so it is
-	 * safe to re-arm it by hand first. */
 	if (!free_run && !(gdma->chen0.val & (1u << ch))) {
+		/* Stalled and disabled: safe to re-arm by hand. */
 		c->int_clr0.val = 0xffffffffu;
 		scanout_rearm(ch);
 	}
+	if (mie)
+		RV_SET_CSR(mstatus, MSTATUS_MIE);
+	c->int_sig_ena0.val = 0;
+	uint32_t sig_rb = c->int_sig_ena0.val;
 	c->int_sig_ena0.val = saved_sig;
+	ESP_LOGI(TAG, "self-test A (CPU interrupts off): chen=%d sar moved %"
+		 PRIu32 " wraps %" PRIu32 " int_st0 0x%08" PRIx32 "->0x%08"
+		 PRIx32 " sig 0x%08" PRIx32 " reads 0x%08" PRIx32
+		 " after writing 0 -> %s",
+		 chen_a ? 1 : 0, moved_a, wraps_a, st_before, st_a,
+		 saved_sig, sig_rb,
+		 free_run ? "HARDWARE FREE-RUN (no re-arm needed)"
+			  : "stalled (re-arm needed after the hand-off)");
+
 
 	wraps_b = gdma_sample_wraps(ch, 600, &moved_b);
 	bool ok = wraps_b >= 30;
