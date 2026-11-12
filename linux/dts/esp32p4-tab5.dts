@@ -256,23 +256,6 @@
 			status = "disabled";
 		};
 
-		/*
-		 * DW-GDMA scanout channel handed over by the boot shim.  The
-		 * shim's DPI stream uses a single full-frame LLI whose valid
-		 * bit the hardware clears on every frame, so the stream dies
-		 * unless software re-arms it in IRQ context (same contract as
-		 * ESP-IDF's trans-done callback and upstream dw-axi-dmac
-		 * cyclic mode).  The driver finds the channel by DAR ==
-		 * MIPI_DSI_BRG_MEM_BASE (0x50105000).  DW-GDMA is ETS
-		 * interrupt source 24, routed to free CLIC slot 25.
-		 */
-		dsi_scanout: dsi-scanout@50081000 {
-			compatible = "espressif,esp32p4-dsi-scanout";
-			reg = <0x50081000 0x600>;
-			interrupts-extended = <&clic0 25 24 IRQ_TYPE_LEVEL_HIGH>;
-			status = "okay";
-		};
-
 		/* Patched at runtime by boot-shim/main.c with the flash MMU VA. */
 		flash@deadbeef {
 			compatible = "mtd-rom";

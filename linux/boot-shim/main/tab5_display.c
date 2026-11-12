@@ -291,27 +291,42 @@ static void backlight_init(void)
 			 LCD_BL_GPIO);
 		return;
 	}
-	ledc_set_fade_time_and_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0,
-				     LCD_BL_DUTY, LCD_BL_FADE_MS,
-				     LEDC_FADE_NO_WAIT);
+	ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, LCD_BL_DUTY);
+	ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
 	ESP_LOGI(TAG, "backlight on: GPIO%d 5 kHz/10-bit XTAL duty %u/1024",
 		 LCD_BL_GPIO, (unsigned)LCD_BL_DUTY);
 }
 
-/* One-line pre-jump status for main.c: confirms what the kernel driver
- * must pick up. */
+/* Last display step before the jump.  The stream free-runs in hardware
+ * (self-test A), so nothing may be left that interrupts the CPU after the
+ * hand-off: the DW-GDMA signals are masked and cleared here, and the stream
+ * is sampled once more to prove it kept running without them. */
 void tab5_display_status(void)
 {
 	if (s_scanout_chan < 0) {
 		ESP_LOGI(TAG, "scanout: no DW-GDMA channel tracked");
 		return;
 	}
+	for (int i = 0; i < DWGDMA_CH_COUNT; ++i) {
+		gdma->ch[i].int_sig_ena0.val = 0;
+		gdma->ch[i].int_sig_ena1.val = 0;
+		gdma->ch[i].int_clr0.val = 0xffffffffu;
+	}
+	gdma->common_int_sig_ena0.val = 0;
+	gdma->common_int_clr0.val = 0xffffffffu;
+
+	uint32_t moved, wraps = gdma_sample_wraps(s_scanout_chan, 40, &moved);
 	volatile dmac_channel_reg_t *c = &gdma->ch[s_scanout_chan];
-	ESP_LOGI(TAG, "scanout handoff: ch%d lli=0x%08" PRIx32
-		 " int_st0=0x%08" PRIx32 " chen0=0x%08" PRIx32
-		 " (kernel: espressif,esp32p4-dsi-scanout, ETS src 24)",
-		 s_scanout_chan, s_scanout_lli_pa,
-		 c->int_st0.val, gdma->chen0.val);
+	if (moved > 0)
+		ESP_LOGI(TAG, "free-run OK frames=%" PRIu32 " (ch%d sar moved %"
+			 PRIu32 " in 40 ms, chen0=0x%08" PRIx32 " int_st0=0x%08"
+			 PRIx32 ", all GDMA interrupt signals masked)",
+			 wraps, s_scanout_chan, moved, gdma->chen0.val,
+			 c->int_st0.val);
+	else
+		ESP_LOGE(TAG, "free-run FAILED after masking: sar frozen, "
+			 "chen0=0x%08" PRIx32 " int_st0=0x%08" PRIx32,
+			 gdma->chen0.val, c->int_st0.val);
 }
 
 void tab5_display_init(struct tab5_fb *out)
