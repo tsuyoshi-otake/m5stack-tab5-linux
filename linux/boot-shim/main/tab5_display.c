@@ -264,15 +264,15 @@ static bool scanout_self_test(int ch)
 	c->int_sig_ena0.val = 0;
 	uint32_t sig_rb = c->int_sig_ena0.val;
 	c->int_sig_ena0.val = saved_sig;
-	ESP_LOGI(TAG, "self-test A (CPU interrupts off): chen=%d sar moved %"
-		 PRIu32 " wraps %" PRIu32 " int_st0 0x%08" PRIx32 "->0x%08"
-		 PRIx32 " sig 0x%08" PRIx32 " reads 0x%08" PRIx32
-		 " after writing 0 -> %s",
-		 chen_a ? 1 : 0, moved_a, wraps_a, st_before, st_a,
-		 saved_sig, sig_rb,
-		 free_run ? "HARDWARE FREE-RUN (no re-arm needed)"
-			  : "stalled (re-arm needed after the hand-off)");
-
+	/* The console was starved while interrupts were off; let it drain. */
+	esp_rom_delay_us(50000);
+	ESP_LOGI(TAG, "self-test A (CPU irq off): chen=%d moved=%" PRIu32
+		 " wraps=%" PRIu32 " -> %s", chen_a ? 1 : 0, moved_a, wraps_a,
+		 free_run ? "HARDWARE FREE-RUN" : "STALLED");
+	esp_rom_delay_us(20000);
+	ESP_LOGI(TAG, "self-test A regs: st 0x%08" PRIx32 "->0x%08" PRIx32
+		 " sig 0x%08" PRIx32 " reads 0x%08" PRIx32 " after writing 0",
+		 st_before, st_a, saved_sig, sig_rb);
 
 	wraps_b = gdma_sample_wraps(ch, 600, &moved_b);
 	bool ok = wraps_b >= 30;
