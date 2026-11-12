@@ -32,8 +32,7 @@ Signed-off-by: Devin <devin@cognition.ai>
 diff --git a/drivers/gpio/gpio-esp32p4.c b/drivers/gpio/gpio-esp32p4.c
 --- a/drivers/gpio/gpio-esp32p4.c
 +++ b/drivers/gpio/gpio-esp32p4.c
-@@ -73,16 +73,24 @@ struct esp32p4_gpio_bank_regs {
- 	u16 out_w1ts;
+@@ -74,15 +74,23 @@ struct esp32p4_gpio_bank_regs {
  	u16 out_w1tc;
  	u16 enable_w1ts;
  	u16 enable_w1tc;
