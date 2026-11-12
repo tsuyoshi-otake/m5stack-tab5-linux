@@ -17,6 +17,7 @@
 /dts-v1/;
 
 #include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/gpio/gpio.h>
 
 / {
 	#address-cells = <1>;
@@ -167,15 +168,35 @@
 		};
 
 		/*
-		 * GPIO bank 1 (hw pins 32..56), driven by the espressif,esp32p4-gpio
+		 * GPIO bank 0 (hw pins 0..31), driven by the espressif,esp32p4-gpio
 		 * controller (patch 0002-gpio-esp32p4.patch, reused verbatim from the
-		 * WHY2025 reference).  On Tab5 the C6 reset/EN is GPIO15 -- bank 0 --
-		 * and the boot shim's pulse_c6_reset() owns it before Linux starts.
-		 * The same reset hazard as on Stamp applies symmetrically: a live
-		 * `resetpin=` would reset the C6 mid-transaction; esp-hosted-ng
-		 * patch 0002 keeps resetpin at HOST_GPIO_PIN_INVALID for that
-		 * reason.  Do not add a bank-0 node for GPIO15 here.
+		 * WHY2025 reference).  Needed for the touch stack: hw GPIO23 is the
+		 * ST712x INT line (a GPIO_INT0 child interrupt) and hw GPIO31 is the
+		 * bit-banged SDA below.  Bank 0 also owns the GPIO_INT0 parent line,
+		 * so this node doubles as the pin-interrupt controller.
+		 *
+		 * Exposing bank 0 does not revive the C6-reset hazard the phase-1
+		 * notes guarded against: the hazard was never the node itself but a
+		 * Linux driver asserting GPIO15 (C6 EN/reset).  Nothing in DT claims
+		 * GPIO15, and esp-hosted-ng still runs with resetpin =
+		 * HOST_GPIO_PIN_INVALID (its stamp-p4 defaults patch), so no Linux
+		 * consumer ever requests that pin; the reset pulse stays shim-owned.
+		 * GPIO_INT0 is ETS source 74 (INTMTX map reg +0x128); CLIC slot 26
+		 * is free on this board.
 		 */
+		gpio0: gpio-bank0@500e0000 {
+			compatible = "espressif,esp32p4-gpio";
+			reg = <0x500e0000 0x1000>;
+			espressif,bank-id = <0>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			interrupts-extended = <&clic0 26 74 IRQ_TYPE_LEVEL_HIGH>;
+			status = "okay";
+		};
+
+		/* GPIO bank 1 (hw pins 32..56): SCL lives on hw GPIO32. */
 		gpio1: gpio-bank1@500e0000 {
 			compatible = "espressif,esp32p4-gpio";
 			reg = <0x500e0000 0x1000>;
@@ -295,6 +316,53 @@
 			compatible = "mtd-rom";
 			reg = <0xdeadbeef 0xcafefade>;
 			bank-width = <4>;
+		};
+	};
+
+	/*
+	 * Internal I2C bus, bit-banged: this kernel tree has no P4 I2C
+	 * controller driver, so i2c-gpio drives the bus the stock
+	 * image puts on SDA=GPIO31 (bank 0) / SCL=GPIO32 (bank 1).
+	 * The boot shim releases the IDF I2C master and returns both
+	 * pads to plain GPIO before the jump (tab5_i2c_release), so
+	 * this driver finds clean inputs to toggle.  Direction-toggle
+	 * open-drain emulation is used (no *-open-drain props):
+	 * Tab5 carries the stock external pull-ups and the P4 pads
+	 * are not declared hardware open-drain to gpiolib here.
+	 * ~100 kHz like the stock touch transactions.
+	 *
+	 * Other chips live on this bus (expanders 0x43/0x44, codec,
+	 * RTC, fuel gauge) but are intentionally unclaimed: the
+	 * expanders are shim-programmed rails (TP_RST stays
+	 * released) and the rest is out of scope for v1.  The node
+	 * sits at root level: i2c-gpio is a software adapter with no
+	 * register window, not an soc unit.
+	 */
+	i2c0: i2c-gpio {
+		compatible = "i2c-gpio";
+		#address-cells = <1>;
+		#size-cells = <0>;
+		gpios = <&gpio0 31 GPIO_ACTIVE_HIGH>,	/* SDA */
+			<&gpio1 0 GPIO_ACTIVE_HIGH>;	/* SCL */
+		i2c-gpio,delay-us = <5>;
+		status = "okay";
+
+		/*
+		 * ST7121/ST7123-family touch controller (Sitronix).
+		 * INT is open-drain active-low on GPIO23 with the
+		 * shim leaving a pull-up; the chip pulses it low per
+		 * touch report like the stock NEGEDGE setup.
+		 * TP_RST is expander 0x43 P5 -- not modelled; the shim
+		 * keeps it released and the driver never resets.
+		 */
+		touch@55 {
+			compatible = "sitronix,st7123";
+			reg = <0x55>;
+			interrupts-extended =
+				<&gpio0 23 IRQ_TYPE_EDGE_FALLING>;
+			touchscreen-size-x = <720>;
+			touchscreen-size-y = <1280>;
+			status = "okay";
 		};
 	};
 

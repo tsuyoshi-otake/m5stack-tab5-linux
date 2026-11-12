@@ -1211,6 +1211,26 @@ fi
 if $lab_profile; then
 	cat "${firmware_root}/linux/m3-lab/kernel.config.fragment" >>"${kernel_config_fragment}"
 fi
+if [[ "$board" == "tab5" ]]; then
+	cat >>"${kernel_config_fragment}" <<'EOF'
+
+# Tab5 internal touch (appended after the profile fragments so it wins
+# over their `# CONFIG_INPUT is not set`): GPIO bank 0 owns the touch INT
+# (GPIO23) and SDA (GPIO31); the internal bus is bit-banged because this
+# tree has no P4 I2C controller driver, and the ST712x controller is an
+# evdev multitouch device (linux/tab5/0096).  GPIOLIB/GPIO_ESP32P4 repeat
+# the m2 fragment lines so non-network Tab5 profiles work too.
+CONFIG_GPIOLIB=y
+CONFIG_GPIO_ESP32P4=y
+CONFIG_I2C=y
+CONFIG_I2C_GPIO=y
+CONFIG_I2C_CHARDEV=y
+CONFIG_INPUT=y
+CONFIG_INPUT_EVDEV=y
+CONFIG_INPUT_TOUCHSCREEN=y
+CONFIG_TOUCHSCREEN_ST7123=y
+EOF
+fi
 if [[ -n "$pstore_identity" ]]; then
 	cat >>"${kernel_config_fragment}" <<'EOF'
 
