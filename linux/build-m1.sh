@@ -1114,9 +1114,11 @@ for patch_name in "${patches[@]}"; do
 	fi
 done
 # Tab5 board kernel patches (linux/tab5/*.patch) apply only to the
-# Tab5 kernel: the DSI-scanout GDMA re-arm driver and the simplefb
-# cache-flush ops are meaningless on Stamp boards and must not leak
-# into the shared patch stage.
+# Tab5 kernel: the DSI-scanout GDMA re-arm driver, the simplefb
+# cache-flush ops, the ST7123 touch driver, and the esp32p4-gpio
+# single-bit-direction fix (0097) are meaningless on Stamp boards and
+# must not leak into the shared patch stage.  They stage in glob
+# order, so they apply after kernel-patches/0002-gpio-esp32p4.patch.
 if [[ "${ES_BOARD:-stamp-p4}" == "tab5" ]]; then
 	tab5_patches=()
 	for p in "${script_dir}/tab5/"*.patch; do
