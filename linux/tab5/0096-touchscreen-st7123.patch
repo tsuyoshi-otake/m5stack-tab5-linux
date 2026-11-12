@@ -30,8 +30,8 @@ Signed-off-by: Devin <devin@cognition.ai>
 ---
  drivers/input/touchscreen/Kconfig  |   9 +
  drivers/input/touchscreen/Makefile |   1 +
- drivers/input/touchscreen/st7123.c | 259 +++++++++++++++++++++++++++++
- 3 files changed, 269 insertions(+)
+ drivers/input/touchscreen/st7123.c | 267 +++++++++++++++++++++++++++++
+ 3 files changed, 276 insertions(+)
 
 diff --git a/drivers/input/touchscreen/Kconfig b/drivers/input/touchscreen/Kconfig
 --- a/drivers/input/touchscreen/Kconfig
@@ -63,7 +63,7 @@ diff --git a/drivers/input/touchscreen/st7123.c b/drivers/input/touchscreen/st71
 new file mode 100644
 --- /dev/null
 +++ b/drivers/input/touchscreen/st7123.c
-@@ -0,0 +1,247 @@
+@@ -0,0 +1,267 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Sitronix ST7123-family (ST7121/ST7123) I2C touchscreen driver.
@@ -112,6 +112,7 @@ new file mode 100644
 +#define ST7123_MAX_POINTS	10
 +#define ST7123_POINT_LEN	7
 +#define ST7123_POLL_MS		50 /* 20 Hz poll fallback */
++#define ST7123_DRAIN_MAX	4 /* INT-drain re-reads per trigger */
 +
 +struct st7123_ts {
 +	struct i2c_client *client;
@@ -152,33 +153,44 @@ new file mode 100644
 +	u8 adv;
 +	u8 n = ts->max_touches;
 +	unsigned int i;
++	int guard = ST7123_DRAIN_MAX;
 +
-+	if (st7123_read(ts->client, ST7123_REG_ADV_INFO, &adv, 1) < 0)
-+		return;
-+	if (adv & ST7123_ADV_WITH_COORD) {
-+		if (st7123_read(ts->client, ST7123_REG_REPORT, ts->buf,
-+				n * ST7123_POINT_LEN) < 0)
++	/*
++	 * INT is an edge on the wire but effectively level-qualified:
++	 * the chip holds it low while reports queue.  With a pure
++	 * falling-edge request a low-held line yields no more edges, so
++	 * drain the pending flag each trigger, bounded so a stuck flag
++	 * cannot wedge the IRQ thread (the 20 Hz poll also covers it).
++	 */
++	do {
++		if (st7123_read(ts->client, ST7123_REG_ADV_INFO, &adv, 1) < 0)
 +			return;
-+	} else {
-+		memset(ts->buf, 0, n * ST7123_POINT_LEN);
-+	}
++		if (adv & ST7123_ADV_WITH_COORD) {
++			if (st7123_read(ts->client, ST7123_REG_REPORT,
++					ts->buf, n * ST7123_POINT_LEN) < 0)
++				return;
++		} else {
++			memset(ts->buf, 0, n * ST7123_POINT_LEN);
++		}
 +
-+	for (i = 0; i < n; i++) {
-+		const u8 *r = &ts->buf[i * ST7123_POINT_LEN];
-+		bool down = r[0] & 0x80;
-+		unsigned int x = ((r[0] & 0x3f) << 8) | r[1];
-+		unsigned int y = (r[2] << 8) | r[3];
++		for (i = 0; i < n; i++) {
++			const u8 *r = &ts->buf[i * ST7123_POINT_LEN];
++			bool down = r[0] & 0x80;
++			unsigned int x = ((r[0] & 0x3f) << 8) | r[1];
++			unsigned int y = (r[2] << 8) | r[3];
 +
-+		input_mt_slot(input, i);
-+		if (!input_mt_report_slot_state(input, MT_TOOL_FINGER, down))
-+			continue;
-+		if (!down)
-+			continue;
-+		touchscreen_report_pos(input, &ts->prop, x, y, true);
-+		input_report_abs(input, ABS_MT_PRESSURE, r[4]);
-+	}
-+	input_mt_sync_frame(input);
-+	input_sync(input);
++			input_mt_slot(input, i);
++			if (!input_mt_report_slot_state(input, MT_TOOL_FINGER,
++							down))
++				continue;
++			if (!down)
++				continue;
++			touchscreen_report_pos(input, &ts->prop, x, y, true);
++			input_report_abs(input, ABS_MT_PRESSURE, r[4]);
++		}
++		input_mt_sync_frame(input);
++		input_sync(input);
++	} while ((adv & ST7123_ADV_WITH_COORD) && --guard > 0);
 +}
 +
 +static irqreturn_t st7123_irq(int irq, void *data)
@@ -235,6 +247,8 @@ new file mode 100644
 +	ts->client = client;
 +	ts->max_touches = clamp_val(geo[4], 1, ST7123_MAX_POINTS);
 +	i2c_set_clientdata(client, ts);
++	/* Unconditional: remove() may cancel it whichever path ran. */
++	INIT_DELAYED_WORK(&ts->work, st7123_poll);
 +
 +	dev_info(&client->dev,
 +		 "st7123: fw %u rev %u.%u.%u.%u max %ux%u touches %u\n",
@@ -259,6 +273,18 @@ new file mode 100644
 +		return error;
 +	touchscreen_parse_properties(input, true, &ts->prop);
 +
++	error = input_register_device(input);
++	if (error)
++		return dev_err_probe(&client->dev, error,
++				     "input device registration failed\n");
++
++	/*
++	 * Start the IRQ/poll only after registration: an early touch must
++	 * never report into an unregistered input_dev.  Teardown relies
++	 * on devm LIFO: remove() cancels the (always-initialised) work,
++	 * then devm frees the IRQ requested last, then devm_input
++	 * unregisters the device, then ts is released.
++	 */
 +	if (client->irq > 0) {
 +		error = devm_request_threaded_irq(&client->dev, client->irq,
 +						  NULL, st7123_irq,
@@ -273,15 +299,9 @@ new file mode 100644
 +	if (client->irq <= 0 || error) {
 +		dev_info(&client->dev, "st7123: polling at %d Hz\n",
 +			 1000 / ST7123_POLL_MS);
-+		INIT_DELAYED_WORK(&ts->work, st7123_poll);
 +		schedule_delayed_work(&ts->work,
 +				      msecs_to_jiffies(ST7123_POLL_MS));
 +	}
-+
-+	error = input_register_device(input);
-+	if (error)
-+		return dev_err_probe(&client->dev, error,
-+				     "input device registration failed\n");
 +	return 0;
 +}
 +
