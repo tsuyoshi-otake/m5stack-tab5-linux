@@ -489,7 +489,11 @@ static bool patch_display_window(uint8_t *dtb, uint32_t total,
 				      fb_pa, fb_bytes);
 	/* The reserved-memory placeholder already carries a valid PSRAM
 	 * address; patching rewrites both cells to the real buffer. */
-	if (!patch_reg_pair_once(dtb, total, 0x49fdf000u, fb_pa, fb_bytes))
+	/* The reserved-memory node is page aligned (the framebuffer itself is
+	 * only cache-line aligned, and the bytes below it hold heap metadata). */
+	uint32_t res_pa = fb_pa & ~0xfffu;
+	uint32_t res_end = (fb_pa + fb_bytes + 0xfffu) & ~0xfffu;
+	if (!patch_reg_pair_once(dtb, total, 0x49fdf000u, res_pa, res_end - res_pa))
 		ok = false;
 	static const char status_needle[] = "reserved-fb";
 	uint32_t status_hits = 0, status_at = 0;

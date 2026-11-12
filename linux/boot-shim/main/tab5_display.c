@@ -314,6 +314,11 @@ void tab5_display_status(void)
 	}
 	gdma->common_int_sig_ena0.val = 0;
 	gdma->common_int_clr0.val = 0xffffffffu;
+	/* The DSI bridge has its own interrupt (underrun), also allocated by
+	 * esp_lcd; leaving it enabled sends Linux's first interrupt-enable
+	 * into the shim's dead vector table. */
+	MIPI_DSI_BRIDGE.int_ena.val = 0;
+	MIPI_DSI_BRIDGE.int_clr.val = 0xffffffffu;
 
 	uint32_t moved, wraps = gdma_sample_wraps(s_scanout_chan, 40, &moved);
 	volatile dmac_channel_reg_t *c = &gdma->ch[s_scanout_chan];
