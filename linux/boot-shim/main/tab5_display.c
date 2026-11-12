@@ -349,6 +349,8 @@ void tab5_display_status(void)
 	REG_WRITE(INTERRUPT_CORE0_DSI_BRIDGE_INT_MAP_REG, 0);
 	for (uint32_t slot = 0; slot < 2; ++slot) {
 		uint32_t s = slot ? brg_slot : gdma_slot;
+		if (!s)
+			continue; /* source was never routed; leave line 0 alone */
 		*(volatile uint8_t *)BYTE_CLIC_INT_IE_REG(s) = 0;
 		*(volatile uint8_t *)BYTE_CLIC_INT_IP_REG(s) = 0;
 	}
