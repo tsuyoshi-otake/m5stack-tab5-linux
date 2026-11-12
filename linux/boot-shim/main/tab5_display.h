@@ -17,7 +17,14 @@
  */
 void tab5_display_init(struct tab5_fb *fb);
 
-/* Serial status line for main.c to emit immediately before the jump:
- * GDMA channel id, LLI address and live state the kernel DSI-scanout
- * driver must pick up. */
+/* Clean handoff for main.c to run immediately before the jump:
+ * detaches the two display interrupt sources, quiesces the channel
+ * once it stalls, clears all display interrupt state, and prints the
+ * read-back line. */
 void tab5_display_status(void);
+
+/* Scan-out facts for the DTB dsi-scanout node patch: the SRAM LLI
+ * address (0 when unknown) and the DW-GDMA channel index (-1 when
+ * unknown). */
+uint32_t tab5_scanout_lli(void);
+int tab5_scanout_chan(void);

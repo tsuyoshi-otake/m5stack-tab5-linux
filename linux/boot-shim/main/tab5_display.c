@@ -16,34 +16,37 @@
  * -------------------------------
  * ESP-IDF's DPI panel driver feeds the DSI bridge through one DW-GDMA
  * channel programmed with a single full-frame link-list item (LLI).
- * Whether the stream could free-run across the Linux jump is settled
- * by register analysis rather than experiment:
+ * Measured on the board (P4 v1.3):
  *
- *   - DW-GDMA clears the LLI "valid" bit (ctrl_hi bit 31) in memory
- *     when a block finishes -- the hardware writes the descriptor back.
- *     ESP-IDF's trans-done callback re-marks the item and re-enables
- *     the channel on EVERY frame (esp_lcd_panel_dpi.c
- *     mipi_dsi_dma_trans_done_cb: dw_gdma_lli_set_block_markers +
- *     dw_gdma_channel_use_link_list + dw_gdma_channel_enable_ctrl).
- *   - The upstream dw-axi-dmac driver does exactly the same for cyclic
- *     transfers (dw-axi-dmac-platform.c re-marks CH_CTL_H_LLI_VALID and
- *     re-enables the channel in IRQ context).  If the hardware could
- *     loop a marked-valid LLI by itself, neither driver would re-arm.
+ *   - There is no hardware free-run: with the CPU's interrupts off the
+ *     channel stalls after one frame (chen 0, int_st0 latches
+ *     DMA_TFR_DONE).  The hardware clears the LLI valid bit in memory
+ *     on every block end; IDF's trans-done callback re-marks it and
+ *     re-enables the channel each frame, and the Linux
+ *     esp32p4-dsi-scanout driver does the same in IRQ context.
+ *   - A stalled channel re-arms cleanly (valid+last on the item through
+ *     the uncached alias, llp0, chen) and the stream resumes at the
+ *     same rate -- a handoff gap is recoverable, so the panel only
+ *     holds the last frame between the jump and the driver's probe.
+ *   - Channel registers reject writes while the channel is enabled
+ *     (int_sig_ena0 write ignored, llp0 store bus-faults), so every
+ *     register touch below happens only after chen reads 0.
+ *   - llp0 reads back 0x1 while the channel runs (it holds the NEXT
+ *     item), so the item is found by content: the 64-byte-aligned
+ *     record in internal SRAM with sar == framebuffer and
+ *     dar == 0x50105000 (scanout_find_lli).
  *
- * So a pure-hardware self-loop is impossible: re-pointing the LLI tail
- * at itself buys exactly one extra frame, because the valid bit still
- * gets cleared in memory.  The stream therefore survives handoff via
- * the linux/tab5 DSI-scanout kernel driver: it claims the shared
- * DW-GDMA interrupt (ETS source 24, CLIC slot 25 in the Tab5 DTS),
- * finds the channel whose DAR is the DSI-bridge FIFO window
- * (0x50105000), and performs the same re-arm the IDF callback does.
- * Until that driver probes, the panel holds the last completed frame.
- *
- * The self-test below proves both halves of that story on real
- * hardware registers before the jump: masking the channel's interrupt
- * signal stops the IDF callback and the channel auto-disables after
- * the in-flight frame (int_st0 ch_disabled), then a manual re-arm plus
- * restored signal mask produces 30 consecutive frame-done events.
+ * The panic Linux had after the jump is explained by the handoff, not
+ * by the stream: IDF vectors every CPU interrupt line (clicintattr
+ * shv=1, cpu_start.c) and leaves the DW-GDMA (src 24) and DSI-bridge
+ * (src 86) sources routed at the interrupt matrix with their CLIC
+ * slots enabled.  With the channel stalled the done status latches and
+ * holds the line; the first MIE-raising moment in Linux dispatches it
+ * through mtvt into the shim's dead vector table -- IDF code runs on
+ * Linux's stack and double-panics.  tab5_display_status() therefore
+ * detaches both sources and quiesces the channel before the jump; the
+ * kernel keeper re-establishes the GDMA route when it claims
+ * dsi-scanout@50081000 (interrupts-extended <&clic0 25 24 ...>).
  */
 
 #include <inttypes.h>
@@ -69,7 +72,10 @@
 #include "hal/cache_ll.h"
 #include "hal/dw_gdma_ll.h"
 #include "hal/mipi_dsi_brg_ll.h"
+#include "soc/clic_reg.h"
+#include "soc/soc.h"
 #include "soc/dw_gdma_struct.h"
+#include "soc/interrupt_core0_reg.h"
 #include "soc/mipi_dsi_bridge_struct.h"
 #include "tab5_display.h"
 #include "tab5_layout.h"
@@ -198,22 +204,20 @@ static void scanout_rearm(int ch)
 }
 
 /*
- * Two-phase serial self-test, read-only on the hardware except for the
- * interrupt-signal mask.  The channel's llp0 can only be written while the
- * channel is disabled (a store while it runs is a bus fault on this SoC),
- * so the test never re-arms a running channel.
+ * Three-fact serial self-test.  The channel's llp0 can only be written
+ * while the channel is disabled (a store while it runs is a bus fault
+ * on this SoC), so the test never re-arms a running channel.
  *
- * Phase A ("masked"): silence the channel's interrupt signals so the IDF
- * trans-done callback cannot re-arm it, wait four frames, then sample the
- * source pointer for ~40 ms.  A moving pointer means the hardware streams
- * without any CPU help (no kernel keeper needed); a frozen pointer with
- * the enable bit clear means it stalled (the kernel keeper is required).
+ *   1. live rate  -- source-pointer wraps while the IDF trans-done ISR
+ *      re-arms each frame;
+ *   2. irq-off    -- with mstatus.MIE clear the callback dies with the
+ *      CPU and the channel must stall inside a frame: there is no
+ *      hardware free-run;
+ *   3. re-arm     -- a stalled channel takes the kernel-driver sequence
+ *      and the stream resumes.
  *
- * Phase B ("armed"): restore the mask (re-arming a stalled channel while
- * it is disabled), then count source-pointer wraps for ~600 ms: one wrap
- * is one frame, and at least 30 must pass.
- *
- * Returns true when phase B saw a healthy stream.
+ * Returns true when the stall and the resumed stream behave as
+ * designed.
  */
 static uint32_t gdma_sample_wraps(int ch, uint32_t ms, uint32_t *moved)
 {
@@ -238,47 +242,37 @@ static bool scanout_self_test(int ch)
 {
 	volatile dmac_channel_reg_t *c = &gdma->ch[ch];
 	const uint32_t frame_us = 17000;
-	uint32_t saved_sig = c->int_sig_ena0.val;
-	uint32_t moved_a, wraps_a, moved_b, wraps_b;
-	bool free_run;
+	uint32_t moved, wraps_live, wraps_b, st_a;
+	uint32_t chen_a;
+	bool stalled, ok;
 
-	/* Phase A runs with CPU interrupts globally off (mstatus.MIE clear),
-	 * which is exactly the state after the jump to Linux: no ISR of any
-	 * kind can re-arm the channel.  Masking the channel's signal register
-	 * alone was not proof (its read-back is not what was written). */
-	uint32_t st_before = c->int_st0.val;
+	wraps_live = gdma_sample_wraps(ch, 300, &moved);
+
 	unsigned long mie = RV_CLEAR_CSR(mstatus, MSTATUS_MIE) & MSTATUS_MIE;
-	c->int_clr0.val = 0xffffffffu;
-	esp_rom_delay_us(4 * frame_us);
-	uint32_t chen_a = gdma->chen0.val & (1u << ch);
-	wraps_a = gdma_sample_wraps(ch, 40, &moved_a);
-	uint32_t st_a = c->int_st0.val;
-	free_run = moved_a > 0;
-	if (!free_run && !(gdma->chen0.val & (1u << ch))) {
-		/* Stalled and disabled: safe to re-arm by hand. */
+	esp_rom_delay_us(2 * frame_us);
+	chen_a = gdma->chen0.val & (1u << ch);
+	gdma_sample_wraps(ch, 40, &moved);
+	st_a = c->int_st0.val;
+	stalled = (moved == 0) && (chen_a == 0);
+	if (stalled) {
+		/* Channel disabled: register writes are legal now. */
 		c->int_clr0.val = 0xffffffffu;
 		scanout_rearm(ch);
 	}
 	if (mie)
 		RV_SET_CSR(mstatus, MSTATUS_MIE);
-	c->int_sig_ena0.val = 0;
-	uint32_t sig_rb = c->int_sig_ena0.val;
-	c->int_sig_ena0.val = saved_sig;
 	/* The console was starved while interrupts were off; let it drain. */
 	esp_rom_delay_us(50000);
-	ESP_LOGI(TAG, "self-test A (CPU irq off): chen=%d moved=%" PRIu32
-		 " wraps=%" PRIu32 " -> %s", chen_a ? 1 : 0, moved_a, wraps_a,
-		 free_run ? "HARDWARE FREE-RUN" : "STALLED");
-	esp_rom_delay_us(20000);
-	ESP_LOGI(TAG, "self-test A regs: st 0x%08" PRIx32 "->0x%08" PRIx32
-		 " sig 0x%08" PRIx32 " reads 0x%08" PRIx32 " after writing 0",
-		 st_before, st_a, saved_sig, sig_rb);
+	ESP_LOGI(TAG, "self-test: %" PRIu32 " frames/300ms with ISR; "
+		 "irq-off %s (chen=%d st0=0x%08" PRIx32 "); re-arm %s",
+		 wraps_live, stalled ? "stall" : "NO STALL",
+		 chen_a ? 1 : 0, st_a,
+		 stalled ? "issued" : "skipped");
 
-	wraps_b = gdma_sample_wraps(ch, 600, &moved_b);
-	bool ok = wraps_b >= 30;
-	ESP_LOGI(TAG, "self-test B (armed): %" PRIu32 " frames in 600 ms "
-		 "(sar moved %" PRIu32 ", chen=%d) -> %s",
-		 wraps_b, moved_b, (gdma->chen0.val & (1u << ch)) ? 1 : 0,
+	wraps_b = gdma_sample_wraps(ch, 600, &moved);
+	ok = stalled && wraps_b >= 30;
+	ESP_LOGI(TAG, "self-test: %" PRIu32 " frames/600ms after re-arm "
+		 "-> %s", wraps_b,
 		 ok ? "stream healthy" : "STREAM NOT HEALTHY");
 	return ok;
 }
@@ -312,41 +306,102 @@ static void backlight_init(void)
 		 LCD_BL_GPIO, (unsigned)LCD_BL_DUTY);
 }
 
-/* Last display step before the jump.  The stream free-runs in hardware
- * (self-test A), so nothing may be left that interrupts the CPU after the
- * hand-off: the DW-GDMA signals are masked and cleared here, and the stream
- * is sampled once more to prove it kept running without them. */
+/*
+ * Last display step before the jump: make the hand-off silent.
+ *
+ * Every IDF-allocated CPU line is vectored (clicintattr shv=1) and the
+ * kernel's CLIC driver only touches the slots it claims, so any display
+ * source still routed+enabled at the jump would dispatch through mtvt
+ * into the dead IDF vector table the moment Linux raises MIE -- the
+ * board showed exactly that (IDF panic text after "bootconsole
+ * enabled").  Sequence, all with mstatus.MIE clear:
+ *
+ *   1. detach the DW-GDMA (src 24) and DSI-bridge (src 86) sources at
+ *      the interrupt matrix so they cannot reach any CLIC slot;
+ *   2. clear int-enable and pending on the two CLIC slots the IDF
+ *      routes had pointed at;
+ *   3. mask and clear the DSI bridge's own interrupt;
+ *   4. wait for the GDMA channel to stall (no re-armer can run any
+ *      more; one frame worst case) -- channel registers are only
+ *      writable while chen is 0, so masking and clearing the channel's
+ *      interrupt status comes last;
+ *   5. read back and print, so the serial log states the quiesced
+ *      state Linux inherits.
+ *
+ * The kernel esp32p4-dsi-scanout driver re-establishes the GDMA route
+ * for its own slot when it probes (clic_domain_map writes
+ * intmtx[source] = slot), then re-arms the stalled channel.
+ */
 void tab5_display_status(void)
 {
 	if (s_scanout_chan < 0) {
 		ESP_LOGI(TAG, "scanout: no DW-GDMA channel tracked");
 		return;
 	}
-	for (int i = 0; i < DWGDMA_CH_COUNT; ++i) {
-		gdma->ch[i].int_sig_ena0.val = 0;
-		gdma->ch[i].int_sig_ena1.val = 0;
-		gdma->ch[i].int_clr0.val = 0xffffffffu;
+	volatile dmac_channel_reg_t *c = &gdma->ch[s_scanout_chan];
+	unsigned long mie = RV_CLEAR_CSR(mstatus, MSTATUS_MIE) & MSTATUS_MIE;
+
+	uint32_t gdma_route = REG_READ(INTERRUPT_CORE0_GDMA_INT_MAP_REG);
+	uint32_t brg_route = REG_READ(INTERRUPT_CORE0_DSI_BRIDGE_INT_MAP_REG);
+	uint32_t gdma_slot = gdma_route & 0x3f;
+	uint32_t brg_slot = brg_route & 0x3f;
+	REG_WRITE(INTERRUPT_CORE0_GDMA_INT_MAP_REG, 0);
+	REG_WRITE(INTERRUPT_CORE0_DSI_BRIDGE_INT_MAP_REG, 0);
+	for (uint32_t slot = 0; slot < 2; ++slot) {
+		uint32_t s = slot ? brg_slot : gdma_slot;
+		*(volatile uint8_t *)BYTE_CLIC_INT_IE_REG(s) = 0;
+		*(volatile uint8_t *)BYTE_CLIC_INT_IP_REG(s) = 0;
 	}
-	gdma->common_int_sig_ena0.val = 0;
-	gdma->common_int_clr0.val = 0xffffffffu;
-	/* The DSI bridge has its own interrupt (underrun), also allocated by
-	 * esp_lcd; leaving it enabled sends Linux's first interrupt-enable
-	 * into the shim's dead vector table. */
 	MIPI_DSI_BRIDGE.int_ena.val = 0;
 	MIPI_DSI_BRIDGE.int_clr.val = 0xffffffffu;
 
-	uint32_t moved, wraps = gdma_sample_wraps(s_scanout_chan, 40, &moved);
-	volatile dmac_channel_reg_t *c = &gdma->ch[s_scanout_chan];
-	if (moved > 0)
-		ESP_LOGI(TAG, "free-run OK frames=%" PRIu32 " (ch%d sar moved %"
-			 PRIu32 " in 40 ms, chen0=0x%08" PRIx32 " int_st0=0x%08"
-			 PRIx32 ", all GDMA interrupt signals masked)",
-			 wraps, s_scanout_chan, moved, gdma->chen0.val,
-			 c->int_st0.val);
-	else
-		ESP_LOGE(TAG, "free-run FAILED after masking: sar frozen, "
-			 "chen0=0x%08" PRIx32 " int_st0=0x%08" PRIx32,
-			 gdma->chen0.val, c->int_st0.val);
+	uint32_t wait_us = 0;
+	while ((gdma->chen0.val & (1u << s_scanout_chan)) && wait_us < 40000) {
+		esp_rom_delay_us(500);
+		wait_us += 500;
+	}
+	uint32_t chen_rb = gdma->chen0.val;
+	if (chen_rb & (1u << s_scanout_chan)) {
+		/* Channel still enabled: touching its registers would
+		 * fault.  The sources are detached so nothing reaches the
+		 * CPU, but the tail clear is skipped. */
+		ESP_LOGW(TAG, "handoff: ch%d still enabled after %" PRIu32
+			 " us; registers left alone", s_scanout_chan, wait_us);
+	} else {
+		c->int_sig_ena0.val = 0;
+		c->int_sig_ena1.val = 0;
+		c->int_clr0.val = 0xffffffffu;
+	}
+	uint32_t st_rb = c->int_st0.val;
+	uint32_t brg_st = MIPI_DSI_BRIDGE.int_st.val;
+	uint32_t gdma_map_rb = REG_READ(INTERRUPT_CORE0_GDMA_INT_MAP_REG);
+	uint32_t brg_map_rb = REG_READ(INTERRUPT_CORE0_DSI_BRIDGE_INT_MAP_REG);
+
+	if (mie)
+		RV_SET_CSR(mstatus, MSTATUS_MIE);
+	esp_rom_delay_us(50000); /* console drain after the irq-off window */
+
+	ESP_LOGI(TAG, "handoff: gdma route %u->%u brg route %u->%u, "
+		 "slots %u/%u IE+IP cleared, ch%d chen0=0x%08" PRIx32
+		 " st0=0x%08" PRIx32 " brg_st=0x%08" PRIx32
+		 " (Linux dsi-scanout re-arms)",
+		 gdma_route & 0x3f, gdma_map_rb & 0x3f,
+		 brg_route & 0x3f, brg_map_rb & 0x3f,
+		 gdma_slot, brg_slot, s_scanout_chan, chen_rb, st_rb, brg_st);
+}
+
+/* Address of the scan-out LLI in internal SRAM, found by content; 0 if
+ * the stream never came up.  Written into the DTB for the kernel
+ * driver. */
+uint32_t tab5_scanout_lli(void)
+{
+	return s_scanout_lli_pa;
+}
+
+/* DW-GDMA channel streaming into the DSI bridge; -1 when unknown. */
+int tab5_scanout_chan(void)
+{
+	return s_scanout_chan;
 }
 
 void tab5_display_init(struct tab5_fb *out)
@@ -464,21 +519,6 @@ void tab5_display_init(struct tab5_fb *out)
 	out->bytes = FB_BYTES;
 	out->ok = true;
 
-	/* First-boot diagnostics: every channel's view, then again after a
-	 * pause with the load path still idle, to tell "stream dead" from
-	 * "stream killed by the kernel copy that follows". */
-	for (int pass = 0; pass < 2; ++pass) {
-		for (int i = 0; i < DWGDMA_CH_COUNT; ++i) {
-			volatile dmac_channel_reg_t *c = &gdma->ch[i];
-			ESP_LOGI(TAG, "diag%d ch%d: sar=0x%08" PRIx32 " dar=0x%08" PRIx32
-				 " llp=0x%08" PRIx32 " st=0x%08" PRIx32
-				 " sig=0x%08" PRIx32 " chen=0x%08" PRIx32,
-				 pass, i, c->sar0.val, c->dar0.val, c->llp0.val,
-				 c->int_st0.val, c->int_sig_ena0.val, gdma->chen0.val);
-		}
-		if (pass == 0)
-			esp_rom_delay_us(300000);
-	}
 	s_scanout_lli_pa = scanout_find_lli(out->pa);
 	ESP_LOGI(TAG, "scanout LLI at 0x%08" PRIx32, s_scanout_lli_pa);
 	if (scanout_find_channel() < 0 || !s_scanout_lli_pa) {

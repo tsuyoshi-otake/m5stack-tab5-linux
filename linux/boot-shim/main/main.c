@@ -482,6 +482,46 @@ static bool patch_reg_pair_once(uint8_t *dtb, uint32_t total,
 	return true;
 }
 
+/* Single-cell variant of patch_reg_pair_once for the dsi-scanout
+ * node's scalar properties. */
+static bool patch_u32_once(uint8_t *dtb, uint32_t total,
+			   uint32_t magic, uint32_t value)
+{
+	uint8_t want[4] = {
+		(uint8_t)(magic >> 24), (uint8_t)(magic >> 16),
+		(uint8_t)(magic >> 8), (uint8_t)magic,
+	};
+	uint8_t repl[4] = {
+		(uint8_t)(value >> 24), (uint8_t)(value >> 16),
+		(uint8_t)(value >> 8), (uint8_t)value,
+	};
+	uint32_t hits = 0, at = 0;
+	for (uint32_t i = 0; i + 4 <= total; ++i) {
+		if (!memcmp(dtb + i, want, sizeof(want))) {
+			hits++;
+			at = i;
+		}
+	}
+	if (hits != 1)
+		return false;
+	memcpy(dtb + at, repl, sizeof(repl));
+	return true;
+}
+
+/* Write the scan-out LLI address and channel into the dsi-scanout
+ * node.  When the scan-out facts are unknown the placeholders stay and
+ * the kernel driver fails closed. */
+static bool patch_scanout_node(uint8_t *dtb, uint32_t total)
+{
+	uint32_t lli = tab5_scanout_lli();
+	int chan = tab5_scanout_chan();
+	if (!lli || chan < 0)
+		return false;
+	bool ok = patch_u32_once(dtb, total, 0x5ca11000u, lli);
+	ok &= patch_u32_once(dtb, total, 0x5ca12000u, (uint32_t)chan);
+	return ok;
+}
+
 static bool patch_display_window(uint8_t *dtb, uint32_t total,
 				 uint32_t fb_pa, uint32_t fb_bytes)
 {
@@ -884,6 +924,10 @@ void app_main(void)
 	if (s_tab5_fb.ok &&
 	    !patch_display_window(dtb, total, s_tab5_fb.pa, s_tab5_fb.bytes))
 		ESP_LOGW(TAG, "display DTB patch failed; Linux boots headless");
+	if (s_tab5_fb.ok &&
+	    !patch_scanout_node(dtb, total))
+		ESP_LOGW(TAG, "scanout DTB patch failed; dsi-scanout driver "
+			 "fails closed");
 	if (s_tab5_fb.ok)
 		tab5_display_status();
 #endif
