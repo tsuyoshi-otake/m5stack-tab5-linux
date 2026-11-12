@@ -196,71 +196,76 @@ static void scanout_rearm(int ch)
 }
 
 /*
- * Two-phase serial self-test of the handoff contract.
+ * Two-phase serial self-test, read-only on the hardware except for the
+ * interrupt-signal mask.  The channel's llp0 can only be written while the
+ * channel is disabled (a store while it runs is a bus fault on this SoC),
+ * so the test never re-arms a running channel.
  *
- * Phase A ("stall proof"): mask the channel's interrupt signals so the
- * IDF trans-done callback stops firing.  One frame later the channel
- * must have auto-disabled (int_st0 ch_disabled / lli-invalid latched),
- * proving the hardware writes back the LLI and no free-run exists --
- * the same dead state the kernel inherits if its scanout driver is
- * missing.
+ * Phase A ("masked"): silence the channel's interrupt signals so the IDF
+ * trans-done callback cannot re-arm it, wait four frames, then sample the
+ * source pointer for ~40 ms.  A moving pointer means the hardware streams
+ * without any CPU help (no kernel keeper needed); a frozen pointer with
+ * the enable bit clear means it stalled (the kernel keeper is required).
  *
- * Phase B ("armed run"): restore the signal mask, kick the channel
- * with the same re-arm sequence the kernel driver uses, then count 30
- * consecutive frame-done events via the raw status register.  Each
- * event also drives the IDF callback, so the run is self-sustaining.
+ * Phase B ("armed"): restore the mask (re-arming a stalled channel while
+ * it is disabled), then count source-pointer wraps for ~600 ms: one wrap
+ * is one frame, and at least 30 must pass.
  *
- * Returns true when both phases behaved as designed.
+ * Returns true when phase B saw a healthy stream.
  */
+static uint32_t gdma_sample_wraps(int ch, uint32_t ms, uint32_t *moved)
+{
+	volatile dmac_channel_reg_t *c = &gdma->ch[ch];
+	uint32_t last = c->sar0.val, wraps = 0, mv = 0;
+
+	for (uint32_t i = 0; i < ms * 4; ++i) {
+		uint32_t now = c->sar0.val;
+		if (now != last)
+			++mv;
+		if (now < last && (last - now) > (FB_BYTES / 2))
+			++wraps; /* jumped back to the frame start */
+		last = now;
+		esp_rom_delay_us(250);
+	}
+	if (moved)
+		*moved = mv;
+	return wraps;
+}
+
 static bool scanout_self_test(int ch)
 {
 	volatile dmac_channel_reg_t *c = &gdma->ch[ch];
-	const uint32_t frame_us = 17000; /* ~58 fps at 70 MHz DPI clock */
+	const uint32_t frame_us = 17000;
 	uint32_t saved_sig = c->int_sig_ena0.val;
-	uint32_t st_a, chen_a;
-	int done = 0, iters = 0;
-	bool stalled, armed_ok;
+	uint32_t moved_a, wraps_a, moved_b, wraps_b;
+	bool free_run;
 
-	/* Phase A: silence the channel for ~3 frames, then inspect. */
-	c->int_clr0.val = 0xffffffffu;
 	c->int_sig_ena0.val = 0;
-	esp_rom_delay_us(3 * frame_us);
-	st_a = c->int_st0.val;
-	chen_a = gdma->chen0.val;
-	stalled = (st_a & (DWGDMA_INT_CH_DISABLED |
-			   DWGDMA_INT_LLI_INVALID_ERR |
-			   DWGDMA_INT_DMA_TFR_DONE)) != 0 &&
-		  (chen_a & (1u << ch)) == 0;
-	ESP_LOGI(TAG, "self-test A (masked): int_st0=0x%08" PRIx32
-		 " chen0=0x%08" PRIx32 " -> %s",
-		 st_a, chen_a, stalled ? "stalled as designed"
-				       : "STILL RUNNING (unexpected)");
+	esp_rom_delay_us(4 * frame_us);
+	uint32_t chen_a = gdma->chen0.val & (1u << ch);
+	wraps_a = gdma_sample_wraps(ch, 40, &moved_a);
+	free_run = moved_a > 0;
+	ESP_LOGI(TAG, "self-test A (ISR masked): chen=%d sar moved %" PRIu32
+		 " wraps %" PRIu32 " int_st0=0x%08" PRIx32 " -> %s",
+		 chen_a ? 1 : 0, moved_a, wraps_a, c->int_st0.val,
+		 free_run ? "HARDWARE FREE-RUN (no re-arm needed)"
+			  : "stalled (kernel keeper required)");
 
-	/* Phase B: restore mask, manual re-arm, count 30 frames. */
-	c->int_sig_ena0.val = saved_sig;
-	c->int_clr0.val = 0xffffffffu;
-	scanout_rearm(ch);
-	while (done < 30 && iters++ < 300) {
-		uint32_t st = c->int_st0.val;
-		if (st & (DWGDMA_INT_BLOCK_TFR_DONE | DWGDMA_INT_DMA_TFR_DONE)) {
-			c->int_clr0.val = st;
-			++done;
-		}
-		esp_rom_delay_us(2000);
+	/* Restore the IDF callback; a stalled channel is disabled, so it is
+	 * safe to re-arm it by hand first. */
+	if (!free_run && !(gdma->chen0.val & (1u << ch))) {
+		c->int_clr0.val = 0xffffffffu;
+		scanout_rearm(ch);
 	}
-	armed_ok = done >= 30;
-	ESP_LOGI(TAG, "self-test B (armed): %d frame-done events in %d polls"
-		 " int_st0=0x%08" PRIx32 " -> %s",
-		 done, iters, c->int_st0.val,
-		 armed_ok ? "stream healthy under re-arm" : "RE-ARM FAILED");
+	c->int_sig_ena0.val = saved_sig;
 
-	if (!armed_ok)
-		return false;
-	if (!stalled)
-		ESP_LOGW(TAG, "stall proof inconclusive; re-arm path "
-			 "verified, treating handoff as needing the "
-			 "kernel driver anyway");
-	return true;
+	wraps_b = gdma_sample_wraps(ch, 600, &moved_b);
+	bool ok = wraps_b >= 30;
+	ESP_LOGI(TAG, "self-test B (armed): %" PRIu32 " frames in 600 ms "
+		 "(sar moved %" PRIu32 ", chen=%d) -> %s",
+		 wraps_b, moved_b, (gdma->chen0.val & (1u << ch)) ? 1 : 0,
+		 ok ? "stream healthy" : "STREAM NOT HEALTHY");
+	return ok;
 }
 
 static void backlight_init(void)
