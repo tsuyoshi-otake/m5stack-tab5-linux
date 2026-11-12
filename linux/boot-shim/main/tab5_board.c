@@ -29,13 +29,17 @@
 #include <inttypes.h>
 
 #include "esp_check.h"
+#include "esp_err.h"
 #include "esp_log.h"
+#include "esp_private/gpio.h"
+#include "esp_rom_gpio.h"
 #include "esp_rom_sys.h"
 #include "riscv/csr.h"
 #include "riscv/rv_utils.h"
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
 #include "soc/clic_reg.h"
+#include "soc/gpio_sig_map.h"
 #include "soc/soc.h"
 #include "soc/interrupt_core0_reg.h"
 #include "tab5_board.h"
@@ -504,68 +508,126 @@ void tab5_c6_power_off(void)
  * Last board step before the jump: take the internal I2C bus away from
  * IDF so nothing on it survives into Linux.
  *
- * i2c_del_master_bus() frees the driver-allocated CPU interrupt
- * (esp_intr_free disables the vector), and i2c_common_deinit_pins()
- * disables the open-drain/output-enable on SDA/SCL, clears the IOMUX
- * open-drain bit, and restores both pads to plain GPIO via
- * gpio_hal_func_sel(PIN_FUNC_GPIO) -- exactly the matrix state the
- * Linux i2c-gpio bit-banger needs.  The bus is a level-structured
- * peripheral: its INTMTX source (I2C0, src 44) is detached and the CLIC
- * slot it pointed at is disarmed for the same reason as the display
- * pair in tab5_display_status() -- a still-enabled IDF-vectored line
- * would dispatch through mtvt into the dead IDF table once Linux
- * raises MIE.  The kernel's own drivers rebuild whatever routes they
- * claim (clic_domain_map writes intmtx[source]=slot).
+ * Order (everything after the expander reads with mstatus.MIE clear):
+ *   0. latch the expander output registers so the log can show the
+ *      real TP_RST / C6-rail state at hand-off -- the blocking I2C
+ *      API needs the I2C0 interrupt route, so read before detaching;
+ *   1. detach the I2C0 source (INTMTX map +0xb0, src 44) so it cannot
+ *      reach any CLIC slot, and disarm the slot it pointed at -- the
+ *      same class as the display pair in tab5_display_status();
+ *   2. i2c_master_bus_rm_device() the two expander handles first:
+ *      i2c_del_master_bus() returns ESP_ERR_INVALID_STATE while its
+ *      device list is non-empty (i2c_master.c), which is exactly the
+ *      failure the first version of this function hit;
+ *   3. i2c_del_master_bus() -- frees the IDF CPU interrupt and runs
+ *      i2c_common_deinit_pins(): open-drain off, output-enable off,
+ *      oen_sel back to the ENABLE bit, PIN_FUNC_GPIO selected, I2C
+ *      input-matrix links zeroed.  If the delete still fails the same
+ *      pin work is done by hand so Linux gets plain pads anyway;
+ *   4. force OUT_SEL back to the plain-GPIO signal (SIG_GPIO_OUT_IDX,
+ *      0x100): the deinit path restores the OE control but never the
+ *      routed output signal, so GPIO31/32 would keep listening to the
+ *      I2C0 peripheral's signals (0x44/0x45) -- harmless while their
+ *      ENABLE bits are clear, but the Linux bit-banger also toggles
+ *      only OUT/ENABLE, so the pads must be plain GPIO end-to-end;
+ *   5. GPIO23 (ST712x INT) to input + pull-up + intr off;
+ *   6. read everything back and print, in tab5_display_status() style.
  *
- * GPIO23 is put back as a pull-up'd input with its interrupt disabled:
- * the ST712x INT pin idles high and is open-drain-ish, so it needs the
- * pull-up to read a defined level and no stale edge state.
  * TP_RST stays released (expander 0x43 P5 output high); the touch
- * controller is never reset after detection and keeps running on its
- * own rail across the jump.
+ * controller is never reset after detection and keeps its rail.
  */
 void tab5_i2c_release(void)
 {
-	uint32_t i2c_slot = 0;
-	uint32_t route_rb = 0;
-	uint32_t pin23_cfg = 0;
+	esp_err_t rm0 = ESP_OK, rm1 = ESP_OK, del = ESP_OK;
+	uint32_t route, i2c_slot, route_rb;
+	uint32_t outsel31, outsel32, en31, en32;
+	uint8_t rd = PI4IO_REG_OUT_SET, out0 = 0, out1 = 0;
+
+	/*
+	 * Read the expander output latches first: the blocking I2C API
+	 * still needs the I2C0 interrupt route live, so this must happen
+	 * before the detach below.  P5 of expander 0x43 is TP_RST (held
+	 * high); P0 of expander 0x44 is the C6 rail.
+	 */
+	bool have0 = s_exp0 &&
+		i2c_master_transmit_receive(s_exp0, &rd, 1, &out0, 1, 100) == ESP_OK;
+	bool have1 = s_exp1 &&
+		i2c_master_transmit_receive(s_exp1, &rd, 1, &out1, 1, 100) == ESP_OK;
+
+	unsigned long mie = RV_CLEAR_CSR(mstatus, MSTATUS_MIE) & MSTATUS_MIE;
+
+	route = REG_READ(INTERRUPT_CORE0_I2C0_INT_MAP_REG);
+	i2c_slot = route & 0x3f;
+	REG_WRITE(INTERRUPT_CORE0_I2C0_INT_MAP_REG, 0);
+	if (i2c_slot) {
+		*(volatile uint8_t *)BYTE_CLIC_INT_IE_REG(i2c_slot) = 0;
+		*(volatile uint8_t *)BYTE_CLIC_INT_IP_REG(i2c_slot) = 0;
+	}
+
+	if (s_exp0) {
+		rm0 = i2c_master_bus_rm_device(s_exp0);
+		s_exp0 = NULL;
+	}
+	if (s_exp1) {
+		rm1 = i2c_master_bus_rm_device(s_exp1);
+		s_exp1 = NULL;
+	}
+	if (rm0 != ESP_OK || rm1 != ESP_OK)
+		ESP_LOGE(TAG, "i2c release: rm_device failed: 0x43=%s 0x44=%s",
+			 esp_err_to_name(rm0), esp_err_to_name(rm1));
 
 	if (!s_i2c_bus) {
-		ESP_LOGW(TAG, "i2c release: bus was never up; GPIO23 still "
-			 "made input+pullup");
+		ESP_LOGW(TAG, "i2c release: bus was never up; pads forced "
+			 "to plain GPIO anyway");
 	} else {
-		unsigned long mie =
-			RV_CLEAR_CSR(mstatus, MSTATUS_MIE) & MSTATUS_MIE;
-		uint32_t route =
-			REG_READ(INTERRUPT_CORE0_I2C0_INT_MAP_REG);
-
-		i2c_slot = route & 0x3f;
-		REG_WRITE(INTERRUPT_CORE0_I2C0_INT_MAP_REG, 0);
-		if (i2c_slot) {
-			*(volatile uint8_t *)BYTE_CLIC_INT_IE_REG(i2c_slot) = 0;
-			*(volatile uint8_t *)BYTE_CLIC_INT_IP_REG(i2c_slot) = 0;
+		del = i2c_del_master_bus(s_i2c_bus);
+		if (del == ESP_OK) {
+			s_i2c_bus = NULL;
+		} else {
+			ESP_LOGE(TAG, "i2c release: i2c_del_master_bus=%s; "
+				 "restoring SDA/SCL pads by hand",
+				 esp_err_to_name(del));
+			for (uint32_t pin = TAB5_I2C_SDA_GPIO;
+			     pin <= TAB5_I2C_SCL_GPIO; ++pin) {
+				gpio_od_disable(pin);
+				gpio_output_disable(pin);
+			}
 		}
-		if (i2c_del_master_bus(s_i2c_bus) != ESP_OK)
-			ESP_LOGW(TAG, "i2c release: bus delete failed; "
-				 "devices still attached?");
-		s_i2c_bus = NULL;
-		s_exp0 = NULL;
-		s_exp1 = NULL;
-		route_rb = REG_READ(INTERRUPT_CORE0_I2C0_INT_MAP_REG);
-		if (mie)
-			RV_SET_CSR(mstatus, MSTATUS_MIE);
 	}
+	/* deinit does not rewrite OUT_SEL; force the plain-GPIO signal. */
+	esp_rom_gpio_connect_out_signal(TAB5_I2C_SDA_GPIO, SIG_GPIO_OUT_IDX,
+					false, false);
+	esp_rom_gpio_connect_out_signal(TAB5_I2C_SCL_GPIO, SIG_GPIO_OUT_IDX,
+					false, false);
+	route_rb = REG_READ(INTERRUPT_CORE0_I2C0_INT_MAP_REG);
+
+	if (mie)
+		RV_SET_CSR(mstatus, MSTATUS_MIE);
 
 	gpio_set_direction(GPIO_NUM_23, GPIO_MODE_INPUT);
 	gpio_set_pull_mode(GPIO_NUM_23, GPIO_PULLUP_ONLY);
 	gpio_set_intr_type(GPIO_NUM_23, GPIO_INTR_DISABLE);
-	pin23_cfg = gpio_get_level(GPIO_NUM_23);
 
-	ESP_LOGI(TAG, "i2c release: I2C0 route %" PRIu32 "->%" PRIu32
-		 ", slot %" PRIu32 " IE+IP cleared; SDA/SCL plain GPIO, "
-		 "GPIO23 input+pu lvl=%" PRIu32 "; TP_RST stays released "
-		 "(exp0 P5 high), touch keeps its rail",
-		 i2c_slot, route_rb & 0x3f, i2c_slot, pin23_cfg);
+	outsel31 = *reg32(GPIO_FUNC_OUT_SEL_BASE + TAB5_I2C_SDA_GPIO * 4u) &
+		0x1ffu;
+	outsel32 = *reg32(GPIO_FUNC_OUT_SEL_BASE + TAB5_I2C_SCL_GPIO * 4u) &
+		0x1ffu;
+	en31 = (*reg32(GPIO_BASE + 0x20u) >> TAB5_I2C_SDA_GPIO) & 1u;
+	en32 = (*reg32(GPIO_BASE + 0x2cu) >> (TAB5_I2C_SCL_GPIO - 32u)) & 1u;
+
+	ESP_LOGI(TAG, "i2c release: rm 0x43=%s 0x44=%s del=%s, "
+		 "I2C0 route %" PRIu32 "->%" PRIu32 " slot %" PRIu32
+		 " IE+IP cleared; outsel31=%03" PRIx32
+		 " outsel32=%03" PRIx32 " en31=%" PRIu32 " en32=%" PRIu32
+		 "; GPIO23 input+pu lvl=%d",
+		 esp_err_to_name(rm0), esp_err_to_name(rm1),
+		 esp_err_to_name(del), i2c_slot, route_rb & 0x3f, i2c_slot,
+		 outsel31, outsel32, en31, en32,
+		 gpio_get_level(GPIO_NUM_23));
+	ESP_LOGI(TAG, "i2c release: exp0 out=%s0x%02x P5/TP_RST=%d, "
+		 "exp1 out=%s0x%02x P0/C6rail=%d -- touch rail left on",
+		 have0 ? "" : "?!", out0, (out0 >> 5) & 1,
+		 have1 ? "" : "?!", out1, out1 & 1);
 }
 
 void tab5_board_init(struct tab5_fb *fb)
