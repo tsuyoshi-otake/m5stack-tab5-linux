@@ -2245,7 +2245,12 @@ if [[ "${C68_L3_SMOKE:-0}" != "1" ]]; then
 	set_config_value "${br_output}/.config" BR2_PACKAGE_M5STAMP_SMP_SMOKE "# BR2_PACKAGE_M5STAMP_SMP_SMOKE is not set"
 fi
 
-rootfs_overlay="${external_root}/${board_dir}/rootfs-overlay"
+# Tab5 builds on the Stamp userland: the Stamp overlay (S00mounts, init
+# scripts, ...) always comes first and the Tab5 overlay on top of it.
+rootfs_overlay="${external_root}/board/stamp-p4/rootfs-overlay"
+if [[ "$board" != stamp-p4 ]]; then
+	rootfs_overlay="${rootfs_overlay} ${external_root}/${board_dir}/rootfs-overlay"
+fi
 post_build_scripts="${external_root}/${board_dir}/post-build.sh"
 users_table="${external_root}/${board_dir}/users.txt"
 busybox_fragments=""
@@ -2254,7 +2259,7 @@ if $network_profile; then
 	# applets enabled even when no SSH profile is selected; otherwise the
 	# script's deliberately swallowed `modprobe` failure leaves SDIO
 	# discovery looking healthy while wlan0 can never appear.
-	busybox_fragments="${external_root}/${board_dir}/busybox.fragment"
+	busybox_fragments="${external_root}/board/stamp-p4/busybox.fragment"
 fi
 if $ssh_profile; then
 	rootfs_overlay="${rootfs_overlay} ${m3_stage}/rootfs-overlay"

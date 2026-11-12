@@ -77,6 +77,10 @@ if [[ "$profile" == m2 || "$profile" == c68 ]]; then
 else
 	export SDKCONFIG_DEFAULTS="${project_dir}/sdkconfig.defaults"
 fi
+if [[ "${ES_BOARD}" == tab5 ]]; then
+	SDKCONFIG_DEFAULTS="${SDKCONFIG_DEFAULTS};${project_dir}/sdkconfig-tab5.defaults"
+	export SDKCONFIG_DEFAULTS
+fi
 
 rm -f "${output}/sdkconfig" "${output}/sdkconfig.old"
 if [[ "$profile" == c68 ]]; then

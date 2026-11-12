@@ -1,0 +1,6 @@
+# Tab5 only (ES_BOARD=tab5): the display path needs a PSRAM heap for the DPI
+# framebuffer.  The Stamp build keeps plain memory-mapped PSRAM (no heap).
+# CAPS_ALLOC puts PSRAM in the heap for MALLOC_CAP_SPIRAM requests only, so
+# the default malloc() stays in internal RAM.
+# CONFIG_SPIRAM_USE_MEMMAP is not set
+CONFIG_SPIRAM_USE_CAPS_ALLOC=y

@@ -297,11 +297,24 @@ void tab5_display_init(struct tab5_fb *out)
 			MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_CACHE_ALIGNED);
 	void *resv_d = heap_caps_malloc(TAB5_LOAD_RESERVE_BYTES,
 			MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_CACHE_ALIGNED);
-	if (resv_k != (void *)(uintptr_t)TAB5_KERNEL_LOAD_PA ||
-	    resv_d != (void *)(uintptr_t)TAB5_DTB_LOAD_PA)
+	/* The PSRAM heap keeps its own metadata at the start of the region,
+	 * so a block lands a few dozen bytes above the window start.  That
+	 * is fine as long as it starts inside the first page: the shim never
+	 * touches the heap again after the framebuffer exists, and the
+	 * kernel/DTB copy overwrites the metadata only at the hand-off. */
+	if (!resv_k || !resv_d ||
+	    (uintptr_t)resv_k < TAB5_KERNEL_LOAD_PA ||
+	    (uintptr_t)resv_k >= TAB5_KERNEL_LOAD_PA + 0x1000u ||
+	    (uintptr_t)resv_d < TAB5_DTB_LOAD_PA ||
+	    (uintptr_t)resv_d >= TAB5_DTB_LOAD_PA + 0x1000u) {
 		ESP_LOGW(TAG, "load-window reservation landed at %p/%p, "
-			 "expecting 0x%08x/0x%08x", resv_k, resv_d,
-			 TAB5_KERNEL_LOAD_PA, TAB5_DTB_LOAD_PA);
+			 "expecting 0x%08x/0x%08x; display skipped",
+			 resv_k, resv_d, TAB5_KERNEL_LOAD_PA, TAB5_DTB_LOAD_PA);
+		heap_caps_free(resv_d);
+		heap_caps_free(resv_k);
+		return;
+	}
+	ESP_LOGI(TAG, "load windows reserved at %p/%p", resv_k, resv_d);
 	/* Never freed: the windows stay out of the heap for the rest of
 	 * the shim's life, which is all that matters here. */
 
