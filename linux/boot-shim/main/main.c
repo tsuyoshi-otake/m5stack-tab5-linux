@@ -930,6 +930,7 @@ void app_main(void)
 			 "fails closed");
 	if (s_tab5_fb.ok)
 		tab5_display_status();
+	tab5_i2c_release();
 #endif
 	cache_hal_writeback_addr(DTB_LOAD_PA, total);
 

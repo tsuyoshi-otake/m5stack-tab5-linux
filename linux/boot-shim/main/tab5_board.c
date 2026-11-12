@@ -26,12 +26,18 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#include <inttypes.h>
 
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
+#include "riscv/csr.h"
+#include "riscv/rv_utils.h"
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
+#include "soc/clic_reg.h"
+#include "soc/soc.h"
+#include "soc/interrupt_core0_reg.h"
 #include "tab5_board.h"
 #include "tab5_display.h"
 
@@ -492,6 +498,74 @@ void tab5_c6_power_off(void)
 		i2c_master_bus_rm_device(dev);
 		i2c_del_master_bus(bus);
 	}
+}
+
+/*
+ * Last board step before the jump: take the internal I2C bus away from
+ * IDF so nothing on it survives into Linux.
+ *
+ * i2c_del_master_bus() frees the driver-allocated CPU interrupt
+ * (esp_intr_free disables the vector), and i2c_common_deinit_pins()
+ * disables the open-drain/output-enable on SDA/SCL, clears the IOMUX
+ * open-drain bit, and restores both pads to plain GPIO via
+ * gpio_hal_func_sel(PIN_FUNC_GPIO) -- exactly the matrix state the
+ * Linux i2c-gpio bit-banger needs.  The bus is a level-structured
+ * peripheral: its INTMTX source (I2C0, src 44) is detached and the CLIC
+ * slot it pointed at is disarmed for the same reason as the display
+ * pair in tab5_display_status() -- a still-enabled IDF-vectored line
+ * would dispatch through mtvt into the dead IDF table once Linux
+ * raises MIE.  The kernel's own drivers rebuild whatever routes they
+ * claim (clic_domain_map writes intmtx[source]=slot).
+ *
+ * GPIO23 is put back as a pull-up'd input with its interrupt disabled:
+ * the ST712x INT pin idles high and is open-drain-ish, so it needs the
+ * pull-up to read a defined level and no stale edge state.
+ * TP_RST stays released (expander 0x43 P5 output high); the touch
+ * controller is never reset after detection and keeps running on its
+ * own rail across the jump.
+ */
+void tab5_i2c_release(void)
+{
+	uint32_t i2c_slot = 0;
+	uint32_t route_rb = 0;
+	uint32_t pin23_cfg = 0;
+
+	if (!s_i2c_bus) {
+		ESP_LOGW(TAG, "i2c release: bus was never up; GPIO23 still "
+			 "made input+pullup");
+	} else {
+		unsigned long mie =
+			RV_CLEAR_CSR(mstatus, MSTATUS_MIE) & MSTATUS_MIE;
+		uint32_t route =
+			REG_READ(INTERRUPT_CORE0_I2C0_INT_MAP_REG);
+
+		i2c_slot = route & 0x3f;
+		REG_WRITE(INTERRUPT_CORE0_I2C0_INT_MAP_REG, 0);
+		if (i2c_slot) {
+			*(volatile uint8_t *)BYTE_CLIC_INT_IE_REG(i2c_slot) = 0;
+			*(volatile uint8_t *)BYTE_CLIC_INT_IP_REG(i2c_slot) = 0;
+		}
+		if (i2c_del_master_bus(s_i2c_bus) != ESP_OK)
+			ESP_LOGW(TAG, "i2c release: bus delete failed; "
+				 "devices still attached?");
+		s_i2c_bus = NULL;
+		s_exp0 = NULL;
+		s_exp1 = NULL;
+		route_rb = REG_READ(INTERRUPT_CORE0_I2C0_INT_MAP_REG);
+		if (mie)
+			RV_SET_CSR(mstatus, MSTATUS_MIE);
+	}
+
+	gpio_set_direction(GPIO_NUM_23, GPIO_MODE_INPUT);
+	gpio_set_pull_mode(GPIO_NUM_23, GPIO_PULLUP_ONLY);
+	gpio_set_intr_type(GPIO_NUM_23, GPIO_INTR_DISABLE);
+	pin23_cfg = gpio_get_level(GPIO_NUM_23);
+
+	ESP_LOGI(TAG, "i2c release: I2C0 route %" PRIu32 "->%" PRIu32
+		 ", slot %" PRIu32 " IE+IP cleared; SDA/SCL plain GPIO, "
+		 "GPIO23 input+pu lvl=%" PRIu32 "; TP_RST stays released "
+		 "(exp0 P5 high), touch keeps its rail",
+		 i2c_slot, route_rb & 0x3f, i2c_slot, pin23_cfg);
 }
 
 void tab5_board_init(struct tab5_fb *fb)

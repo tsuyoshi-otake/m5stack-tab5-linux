@@ -55,3 +55,13 @@ void tab5_panel_reset(void);
  * Unknown firmware on a controller that does answer is an ST7123, as in
  * the BSP.  *fw gets the raw byte (0 if nothing answered). */
 enum tab5_panel tab5_detect_panel(uint8_t *fw);
+
+/*
+ * Pre-jump handoff for the internal I2C bus: delete the IDF master bus
+ * (returns SDA/SCL to plain GPIO, frees the I2C interrupt), detach the
+ * I2C0 source at the interrupt matrix, disarm its old CLIC slot, and
+ * leave GPIO23 as a pull-up'd input.  Safe to call when the bus never
+ * came up.  The touch controller itself is not reset -- expander 0x43
+ * P5 (TP_RST) stays released so Linux finds it running at 0x55.
+ */
+void tab5_i2c_release(void);
