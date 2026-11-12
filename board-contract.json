@@ -47,7 +47,7 @@
       "0x41": "INA226 power monitor",
       "0x43": "PI4IOE5V6408 IO expander 0",
       "0x44": "PI4IOE5V6408 IO expander 1",
-      "0x55": "ST7123 touch",
+      "0x55": "ST712x touch (reg 0x0000 first byte: 1 = ST7121, 3 = ST7123; this unit reads 1)",
       "0x68": "BMI270 IMU",
       "0x51": "RX8130 RTC (M5 docs; NOT in this unit's scan - inferred)",
       "0x34": "TCA8418 keypad (keyboard units; NOT in this unit's scan - inferred)"
@@ -58,8 +58,8 @@
     "P1": { "function": "SPK_EN", "boot_state": "out 0 (speaker amp OFF; stock drives 1)" },
     "P2": { "function": "EXT5V_EN", "boot_state": "out 0 (off to save power; stock drives 1)" },
     "P3": { "function": "reserved", "boot_state": "out 0" },
-    "P4": { "function": "LCD_RST", "boot_state": "latch 0, drive low ~10ms, release as input+pull-up" },
-    "P5": { "function": "TP_RST/TP_EN", "boot_state": "out 1 (released; ST7123 is a combined display+touch chip - holding it in reset is untested; stock drives 1)" },
+    "P4": { "function": "LCD_RST", "boot_state": "latch 0, drive low ~10ms, release as input+pull-up; pulsed again for 100 ms together with P5 right before the display init (stock bsp_reset_tp)" },
+    "P5": { "function": "TP_RST/TP_EN", "boot_state": "out 1 (released); the ST712x chips are combined display+touch chips and the stock BSP pulses TP_RST low for 100 ms together with LCD_RST right before the display init (bsp_reset_tp), as the shim does" },
     "P6": { "function": "CAM_RST", "boot_state": "out 0 (camera held off)" },
     "P7": { "function": "headphone detect", "boot_state": "input" }
   },
@@ -88,13 +88,13 @@
     "firmware": "stock ships ESP-Hosted-MCU flavour; ESP-Hosted-NG network_adapter required and flashed via SDIO host_performs_slave_ota (linux/m2/ota-host, Tab5 sdkconfig variant)"
   },
   "display": {
-    "panel": "ST7123 on the measured unit (BSP also handles ST7121/ILI9881C)",
+    "panel": "ST7121 on the measured unit (stock log: \"Detected ST7121 touch controller (FW version: 1), using ST7121 display\"); the BSP also handles ST7123 and ILI9881C/GT911 units, the shim picks ST7121 or ST7123 from the touch firmware byte and skips the display on anything else",
     "resolution": "720x1280",
-    "dsi": "2 data lanes, 1000 Mbps default for ST7123 (965 Mbps is the BSP's ST7121 override), LDO_VO3 2500 mV for PHY",
-    "dpi": "RGB565, 70 MHz, hsync 2/40/40, vsync 2/8/220 (ST7123)",
+    "dsi": "2 data lanes, 965 Mbps per lane for both ST7121 and ST7123 (M5Tab5-UserDemo bsp_display_new_with_handles_to_st7123), LDO_VO3 2500 mV for PHY",
+    "dpi": "RGB565, 70 MHz, hsync 2/40/40, vsync pulse/back/front 20/24/200 (ST7121) or 2/8/220 (ST7123)",
     "reset": "expander 0x43 P4 (open-drain style release)",
-    "backlight": "GPIO22, LEDC ch1 5 kHz; boot keeps ~12% duty",
-    "touch": "ST7123 I2C 0x55, INT GPIO23, TP_RST expander 0x43 P5"
+    "backlight": "GPIO22, LEDC 5 kHz; stock runs 100% (12-bit, timer 0, ch1), the shim boots at ~30% (10-bit, XTAL)",
+    "touch": "ST712x I2C 0x55 (stock driver prints it as ST7123, firmware 1.80.1.16 on this unit), INT GPIO23, TP_RST expander 0x43 P5"
   },
   "usb": {
     "usb_c": "USB Serial/JTAG console (CDC-ACM + JTAG), VID 303A PID 1001",

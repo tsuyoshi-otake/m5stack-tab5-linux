@@ -30,3 +30,28 @@ void tab5_board_init(struct tab5_fb *fb);
 /* #56 deep-sleep hook: clear expander 0x44 P0 (the C6 rail) over the
  * internal I2C bus; the Tab5 equivalent of the Stamp GPIO42 latch. */
 void tab5_c6_power_off(void);
+
+/*
+ * Display+touch chip fitted to this Tab5.  Units ship with one of two
+ * MIPI-DSI panels that need different init tables and video timings, and
+ * the stock BSP (bsp_detect_display_type in m5stack_tab5.c) tells them
+ * apart by the touch controller on I2C 0x55: its 16-bit register 0x0000
+ * reads 1 on an ST7121 and 3 on an ST7123.
+ */
+enum tab5_panel {
+	TAB5_PANEL_NONE = 0, /* nothing answers at 0x55: not an ST712x unit */
+	TAB5_PANEL_ST7121,
+	TAB5_PANEL_ST7123,
+};
+
+/*
+ * Pulse LCD_RST (0x43 P4) and TP_RST (0x43 P5) together for 100 ms and
+ * wait 100 ms after release, exactly like the stock bsp_reset_tp() that
+ * runs right before the stock display init.  The expanders must be up.
+ */
+void tab5_panel_reset(void);
+
+/* Read the touch controller's firmware byte and say which panel it is.
+ * Unknown firmware on a controller that does answer is an ST7123, as in
+ * the BSP.  *fw gets the raw byte (0 if nothing answered). */
+enum tab5_panel tab5_detect_panel(uint8_t *fw);

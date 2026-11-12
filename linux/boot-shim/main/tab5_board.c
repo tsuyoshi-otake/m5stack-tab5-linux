@@ -17,8 +17,9 @@
  * keeps the conservative subset.  The LCD reset line (0x43 P4) goes
  * through the stock assert-then-release sequence (output low 10 ms,
  * then input with internal pull-up) and TP_RST (0x43 P5) is driven 1
- * as in stock: the ST7123 is a combined display+touch chip and holding
- * its touch reset low while the display is initialised is untested.
+ * as in stock.  The ST7121/ST7123 are combined display+touch chips, so
+ * right before the display init the stock BSP pulses both resets low for
+ * 100 ms (bsp_reset_tp); tab5_panel_reset() repeats that.
  * The backlight (GPIO22) is driven low until Linux or a user asks.
  */
 
@@ -323,6 +324,123 @@ static esp_err_t expanders_init(void)
 	ESP_LOGI(TAG, "expanders: C6 rail on, LCD_RST pulsed+released, "
 		 "amp/EXT5V/camera off");
 	return ESP_OK;
+}
+
+/*
+ * Stock bsp_reset_tp() (m5stack_tab5.c), step for step:
+ *   - GPIO23 (the touch INT line) goes back to a plain input with the
+ *     default pull-up;
+ *   - both reset latches (0x43 P4 LCD_RST, P5 TP_RST) are written 0 and
+ *     P4 becomes an output, so both lines are low for 100 ms;
+ *   - TP_RST is latched 1, P4 goes back to an input (the expander's
+ *     pull-up releases the 1.8 V LCD reset rather than push-pulling 3.3 V
+ *     onto it), and the stock waits another 100 ms.
+ * Every register is a read-modify-write so the other pins keep their
+ * levels.  Failures are logged and ignored: the detection that follows
+ * reports whether the controller came back.
+ */
+void tab5_panel_reset(void)
+{
+	uint8_t reg, val;
+
+	if (!s_exp0) {
+		ESP_LOGW(TAG, "panel reset: expander 0x43 not up, skipped");
+		return;
+	}
+	gpio_reset_pin(GPIO_NUM_23);
+
+	reg = PI4IO_REG_OUT_SET;
+	if (i2c_master_transmit_receive(s_exp0, &reg, 1, &val, 1, 100) != ESP_OK)
+		goto fail;
+	val &= (uint8_t)~((1u << 4) | (1u << 5));
+	if (expander_write(s_exp0, PI4IO_REG_OUT_SET, val) != ESP_OK)
+		goto fail;
+	reg = PI4IO_REG_IO_DIR;
+	if (i2c_master_transmit_receive(s_exp0, &reg, 1, &val, 1, 100) != ESP_OK)
+		goto fail;
+	val |= (1u << 4);
+	if (expander_write(s_exp0, PI4IO_REG_IO_DIR, val) != ESP_OK)
+		goto fail;
+	esp_rom_delay_us(100000);
+
+	reg = PI4IO_REG_OUT_SET;
+	if (i2c_master_transmit_receive(s_exp0, &reg, 1, &val, 1, 100) != ESP_OK)
+		goto fail;
+	val &= (uint8_t)~(1u << 4);
+	val |= (1u << 5);
+	if (expander_write(s_exp0, PI4IO_REG_OUT_SET, val) != ESP_OK)
+		goto fail;
+	reg = PI4IO_REG_IO_DIR;
+	if (i2c_master_transmit_receive(s_exp0, &reg, 1, &val, 1, 100) != ESP_OK)
+		goto fail;
+	val &= (uint8_t)~(1u << 4);
+	if (expander_write(s_exp0, PI4IO_REG_IO_DIR, val) != ESP_OK)
+		goto fail;
+	esp_rom_delay_us(100000);
+	ESP_LOGI(TAG, "panel reset: LCD_RST+TP_RST pulsed 100 ms, released");
+	return;
+fail:
+	ESP_LOGW(TAG, "panel reset: expander access failed; continuing");
+}
+
+/*
+ * The touch controller's firmware byte: 16-bit register address 0x0000
+ * (big endian on the wire), one byte back, at 100 kHz like the BSP.  The
+ * controller needs a moment after TP_RST is released, so retry for about
+ * 400 ms before calling it absent.
+ */
+#define TAB5_TOUCH_ADDR 0x55u
+#define TAB5_TOUCH_HZ 100000u
+#define TAB5_FW_ST7121 1u
+#define TAB5_FW_ST7123 3u
+
+enum tab5_panel tab5_detect_panel(uint8_t *fw_out)
+{
+	i2c_device_config_t dev_cfg = {
+		.dev_addr_length = I2C_ADDR_BIT_LEN_7,
+		.device_address = TAB5_TOUCH_ADDR,
+		.scl_speed_hz = TAB5_TOUCH_HZ,
+	};
+	i2c_master_dev_handle_t tp = NULL;
+	const uint8_t reg[2] = { 0x00u, 0x00u };
+	uint8_t fw = 0;
+	bool answered = false;
+
+	if (fw_out)
+		*fw_out = 0;
+	if (!s_i2c_bus ||
+	    i2c_master_bus_add_device(s_i2c_bus, &dev_cfg, &tp) != ESP_OK) {
+		ESP_LOGW(TAG, "panel detect: cannot open I2C device 0x%02x",
+			 TAB5_TOUCH_ADDR);
+		return TAB5_PANEL_NONE;
+	}
+	for (int i = 0; i < 20 && !answered; ++i) {
+		if (i2c_master_transmit_receive(tp, reg, sizeof(reg), &fw, 1,
+						100) == ESP_OK)
+			answered = true;
+		else
+			esp_rom_delay_us(20000);
+	}
+	i2c_master_bus_rm_device(tp);
+
+	if (!answered) {
+		ESP_LOGW(TAG, "panel detect: nothing answers at 0x%02x (reg 0x0000)",
+			 TAB5_TOUCH_ADDR);
+		return TAB5_PANEL_NONE;
+	}
+	if (fw_out)
+		*fw_out = fw;
+	if (fw == TAB5_FW_ST7121) {
+		ESP_LOGI(TAG, "panel detect: touch FW byte %u -> ST7121", fw);
+		return TAB5_PANEL_ST7121;
+	}
+	if (fw == TAB5_FW_ST7123) {
+		ESP_LOGI(TAG, "panel detect: touch FW byte %u -> ST7123", fw);
+		return TAB5_PANEL_ST7123;
+	}
+	ESP_LOGW(TAG, "panel detect: unknown touch FW byte %u, BSP fallback "
+		 "-> ST7123", fw);
+	return TAB5_PANEL_ST7123;
 }
 
 /*

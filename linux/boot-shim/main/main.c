@@ -446,7 +446,7 @@ static bool patch_rootfs_window(uint8_t *dtb, uint32_t total,
 #ifdef BOARD_TAB5
 /*
  * The Tab5 DTS carries three display placeholders patched here after a
- * successful ST7123 bring-up:
+ * successful panel (ST7121/ST7123) bring-up:
  *   - framebuffer0 reg      <0x0dfb0000 0x001c2000> -> fb PA/size
  *   - display_fb_res reg    <0x49fdf000 0x00001000> -> fb PA/size
  *   - framebuffer0 status   "reserved-fb" -> "okay" (custom placeholder

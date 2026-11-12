@@ -2,15 +2,28 @@
 /*
  * M5Stack Tab5 display bring-up inside the boot shim.
  *
- * The stock BSP sequence (esp-bsp bsp/m5stack_tab5/src/bsp_display.c) is:
+ * Tab5 units ship with one of two display+touch chips, ST7121 or ST7123,
+ * and they need different init tables and vsync timings.  The stock BSP
+ * (M5Tab5-UserDemo m5stack_tab5.c, bsp_display_new_with_handles_to_st7123,
+ * which serves both chips) does:
+ *   0. bsp_reset_tp(): pulse LCD_RST and TP_RST together, then read the
+ *      touch controller's firmware byte at I2C 0x55 to learn the panel
+ *      (1 = ST7121, 3 = ST7123); tab5_panel_reset() / tab5_detect_panel()
+ *      in tab5_board.c do the same.  The unit this port was brought up on
+ *      is an ST7121: its stock boot log says "Detected ST7121 touch
+ *      controller (FW version: 1), using ST7121 display" and "Install LCD
+ *      driver of ST7121".  (An earlier revision of this file drove it with
+ *      the ST7123 driver and timings and the panel stayed black.)
  *   1. power the MIPI D-PHY from the P4 internal LDO VO3 at 2.5 V
- *   2. release the panel reset via IO-expander 0x43 P4 (done in
- *      tab5_board.c before this runs)
- *   3. create a 2-lane DSI bus at 1000 Mbps per lane (BSP default;
- *      the 965 Mbps override is applied only on ST7121 boards)
- *   4. attach a DBI command channel and the ST7123 panel with the vendor
- *      init data (disp_init_data_st7123.h, carried next to the driver)
- *   5. DPI in RGB565, 720x1280, 70 MHz dot clock with the ST7123 timing
+ *   2. create a 2-lane DSI bus at 965 Mbps per lane (both chips)
+ *   3. attach a DBI command channel and the driver for that chip: the
+ *      ST7121 driver's built-in init table (the BSP passes init_cmds NULL),
+ *      or the ST7123 vendor table carried next to its driver
+ *      (disp_init_data_st7123.h)
+ *   4. DPI in RGB565, 720x1280, 70 MHz dot clock, hsync 2/40/40, vsync
+ *      pulse/back/front 20/24/200 on ST7121 and 2/8/220 on ST7123
+ *   5. panel reset (software, 120 ms), init table, display on, and only
+ *      then the backlight
  *
  * Scan-out after the jump to Linux
  * -------------------------------
@@ -60,6 +73,7 @@
 #include "esp_ldo_regulator.h"
 #include "esp_lcd_mipi_dsi.h"
 #include "esp_lcd_panel_ops.h"
+#include "esp_lcd_st7121.h"
 #include "esp_lcd_st7123.h"
 #include "disp_init_data_st7123.h"
 #include "driver/gpio.h"
@@ -77,6 +91,7 @@
 #include "soc/dw_gdma_struct.h"
 #include "soc/interrupt_core0_reg.h"
 #include "soc/mipi_dsi_bridge_struct.h"
+#include "tab5_board.h"
 #include "tab5_display.h"
 #include "tab5_layout.h"
 
@@ -85,23 +100,41 @@ static const char *TAG = "tab5-disp";
 #define LCD_H_RES 720
 #define LCD_V_RES 1280
 #define LCD_DSI_LANES 2
-/* BSP default lane rate; the 965 Mbps override is applied only on
- * ST7121 boards (bsp_display.c lane-bitrate select).  The measured unit
- * reports ST7123, so it takes this default. */
-#define LCD_DSI_LANE_MBPS 1000
+/* Both ST712x panels run the DSI link at 965 Mbps per lane in the stock
+ * BSP (bsp_display_new_with_handles_to_st7123: "ST7123/ST7121 lane
+ * bitrate").  An earlier revision of this file used 1000 Mbps, which is
+ * esp-bsp's default for the other Tab5 panels. */
+#define LCD_DSI_LANE_MBPS 965
 #define LCD_DPI_MHZ 70
 #define LCD_DPHY_LDO_CHAN 3
 #define LCD_DPHY_LDO_MV 2500
 
-/* Backlight: stock BSP uses LEDC low-speed timer 0 at 5 kHz / 10-bit on
- * GPIO22 with LEDC_AUTO_CLK.  AUTO on P4 resolves through the
- * global-clock path; this pins XTAL (40 MHz, never gated by the Linux
- * port) so the PWM survives both the Linux handoff and later clock
- * changes.  Duty ~15% matches a dim-but-readable boot splash. */
+/* Per-chip vsync timing, straight from the BSP (is_st7121 ? a : b). */
+struct panel_profile {
+	const char *name;
+	uint16_t vsync_pulse;
+	uint16_t vsync_back;
+	uint16_t vsync_front;
+};
+static const struct panel_profile profile_st7121 = {
+	.name = "ST7121", .vsync_pulse = 20, .vsync_back = 24, .vsync_front = 200,
+};
+static const struct panel_profile profile_st7123 = {
+	.name = "ST7123", .vsync_pulse = 2, .vsync_back = 8, .vsync_front = 220,
+};
+
+/* Backlight: stock BSP uses LEDC low-speed timer 0 at 5 kHz on GPIO22
+ * with LEDC_AUTO_CLK (12-bit duty, channel 1, 100% after display init).
+ * AUTO on P4 resolves through the global-clock path; this pins XTAL
+ * (40 MHz, never gated by the Linux port) so the PWM survives both the
+ * Linux handoff and later clock changes.  The stock 100% together with
+ * the speaker amp and the C6 access point browns out on plain USB power
+ * (live-log.txt), so the shim keeps a conservative level: ~30% is bright
+ * enough to judge the first picture in a lit room. */
 #define LCD_BL_GPIO 22
 #define LCD_BL_DUTY_RES LEDC_TIMER_10_BIT
 #define LCD_BL_FREQ_HZ 5000
-#define LCD_BL_DUTY 154 /* ~15% of 1024 */
+#define LCD_BL_DUTY 307 /* ~30% of 1024 */
 #define LCD_BL_FADE_MS 200
 
 /* Static banner drawn before Linux is loaded.  The framebuffer is RGB565
@@ -131,17 +164,30 @@ static uint8_t s_load_windows[(TAB5_DTB_LOAD_PA - TAB5_KERNEL_LOAD_PA) +
 
 static void draw_splash(uint16_t *fb)
 {
-	/* Dark blue field with a green "M5 Tab5 Linux" band: 5 horizontal
-	 * stripes at the top of the 720x1280 portrait panel. */
+	/* A test card that says something even without text: a dark blue
+	 * field; a red | green | blue bar across the top (left to right, so a
+	 * swapped colour order shows at once); a white band under it; and a
+	 * 4-pixel white frame on the very edge of the 720x1280 portrait
+	 * panel (a cropped or shifted picture shows as a missing frame side). */
 	for (uint32_t i = 0; i < LCD_H_RES * LCD_V_RES; ++i)
 		fb[i] = 0x000fu;
 	for (uint32_t y = 40; y < 120; ++y) {
-		for (uint32_t x = 40; x < LCD_H_RES - 40; ++x)
-			fb[y * FB_STRIDE_PX + x] = 0x07e0u;
+		for (uint32_t x = 40; x < LCD_H_RES - 40; ++x) {
+			uint32_t third = (x - 40) * 3 / (LCD_H_RES - 80);
+			fb[y * FB_STRIDE_PX + x] = third == 0 ? 0xf800u :
+						   third == 1 ? 0x07e0u : 0x001fu;
+		}
 	}
 	for (uint32_t y = 140; y < 170; ++y) {
 		for (uint32_t x = 40; x < LCD_H_RES - 40; ++x)
 			fb[y * FB_STRIDE_PX + x] = 0xffffu;
+	}
+	for (uint32_t y = 0; y < LCD_V_RES; ++y) {
+		for (uint32_t x = 0; x < LCD_H_RES; ++x) {
+			if (y < 4 || y >= LCD_V_RES - 4 || x < 4 ||
+			    x >= LCD_H_RES - 4)
+				fb[y * FB_STRIDE_PX + x] = 0xffffu;
+		}
 	}
 	cache_hal_writeback_addr((uint32_t)(uintptr_t)fb, FB_BYTES);
 }
@@ -423,6 +469,25 @@ void tab5_display_init(struct tab5_fb *out)
 	ESP_LOGI(TAG, "load windows held at %p (%u bytes)", s_load_windows,
 		 (unsigned)sizeof(s_load_windows));
 
+	/* Same first two steps as the stock BSP: reset the display+touch
+	 * chip, then ask the touch controller which chip it is. */
+	tab5_panel_reset();
+	uint8_t touch_fw = 0;
+	const enum tab5_panel kind = tab5_detect_panel(&touch_fw);
+	if (kind == TAB5_PANEL_NONE) {
+		ESP_LOGW(TAG, "no ST7121/ST7123 touch controller at 0x55 (the "
+			 "ILI9881C/GT911 panel variant is not supported); "
+			 "display skipped");
+		return;
+	}
+	const struct panel_profile *prof =
+		kind == TAB5_PANEL_ST7121 ? &profile_st7121 : &profile_st7123;
+	ESP_LOGI(TAG, "panel %s (touch FW byte %u): %u Mbps x %d lanes, "
+		 "vsync %u/%u/%u", prof->name, touch_fw,
+		 (unsigned)LCD_DSI_LANE_MBPS, LCD_DSI_LANES,
+		 (unsigned)prof->vsync_pulse, (unsigned)prof->vsync_back,
+		 (unsigned)prof->vsync_front);
+
 	esp_ldo_channel_handle_t ldo = NULL;
 	esp_lcd_dsi_bus_handle_t dsi = NULL;
 	esp_lcd_panel_io_handle_t io = NULL;
@@ -470,39 +535,59 @@ void tab5_display_init(struct tab5_fb *out)
 			.hsync_back_porch = 40,
 			.hsync_pulse_width = 2,
 			.hsync_front_porch = 40,
-			.vsync_back_porch = 8,
-			.vsync_pulse_width = 2,
-			.vsync_front_porch = 220,
-		},
-	};
-	const st7123_vendor_config_t vendor_cfg = {
-		.init_cmds = disp_init_data_st7123,
-		.init_cmds_size = sizeof(disp_init_data_st7123) /
-				  sizeof(disp_init_data_st7123[0]),
-		.mipi_config = {
-			.dsi_bus = dsi,
-			.dpi_config = &dpi_cfg,
+			.vsync_back_porch = prof->vsync_back,
+			.vsync_pulse_width = prof->vsync_pulse,
+			.vsync_front_porch = prof->vsync_front,
 		},
 	};
 	esp_lcd_panel_dev_config_t panel_cfg = {
-		.reset_gpio_num = GPIO_NUM_NC, /* released via expander 0x43 P4 */
+		.reset_gpio_num = GPIO_NUM_NC, /* software reset; LCD_RST was
+						* pulsed through expander 0x43 P4 */
 		.flags = {
 			.reset_active_high = 0,
 		},
 		.rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
 		.bits_per_pixel = 16,
-		.vendor_config = (void *)&vendor_cfg,
 	};
-	if (esp_lcd_new_panel_st7123(io, &panel_cfg, &panel) != ESP_OK) {
-		ESP_LOGW(TAG, "ST7123 panel failed; display skipped");
+	esp_err_t err;
+	if (kind == TAB5_PANEL_ST7121) {
+		/* init_cmds NULL: the driver's built-in table, as the BSP does. */
+		const st7121_vendor_config_t vendor_cfg = {
+			.init_cmds = NULL,
+			.init_cmds_size = 0,
+			.mipi_config = {
+				.dsi_bus = dsi,
+				.dpi_config = &dpi_cfg,
+			},
+		};
+		panel_cfg.vendor_config = (void *)&vendor_cfg;
+		err = esp_lcd_new_panel_st7121(io, &panel_cfg, &panel);
+	} else {
+		const st7123_vendor_config_t vendor_cfg = {
+			.init_cmds = disp_init_data_st7123,
+			.init_cmds_size = sizeof(disp_init_data_st7123) /
+					  sizeof(disp_init_data_st7123[0]),
+			.mipi_config = {
+				.dsi_bus = dsi,
+				.dpi_config = &dpi_cfg,
+			},
+		};
+		panel_cfg.vendor_config = (void *)&vendor_cfg;
+		err = esp_lcd_new_panel_st7123(io, &panel_cfg, &panel);
+	}
+	if (err != ESP_OK) {
+		ESP_LOGW(TAG, "%s panel failed (%s); display skipped",
+			 prof->name, esp_err_to_name(err));
 		return;
 	}
 	if (esp_lcd_panel_reset(panel) != ESP_OK ||
 	    esp_lcd_panel_init(panel) != ESP_OK ||
 	    esp_lcd_panel_disp_on_off(panel, true) != ESP_OK) {
-		ESP_LOGW(TAG, "ST7123 init sequence failed; display skipped");
+		ESP_LOGW(TAG, "%s init sequence failed; display skipped",
+			 prof->name);
 		return;
 	}
+	ESP_LOGI(TAG, "%s init sequence done", prof->name);
 
 	void *fb = NULL;
 	if (esp_lcd_dpi_panel_get_frame_buffer(panel, 1, &fb) != ESP_OK || !fb) {
@@ -532,7 +617,7 @@ void tab5_display_init(struct tab5_fb *out)
 		ESP_LOGE(TAG, "scanout self-test failed; backlight stays off "
 			 "and the picture may freeze at handoff");
 	}
-	ESP_LOGI(TAG, "ST7123 up: fb @0x%08" PRIx32 " (%" PRIu32 " bytes), "
+	ESP_LOGI(TAG, "%s up: fb @0x%08" PRIx32 " (%" PRIu32 " bytes), "
 		 "stream left running for Linux simple-framebuffer",
-		 out->pa, out->bytes);
+		 prof->name, out->pa, out->bytes);
 }

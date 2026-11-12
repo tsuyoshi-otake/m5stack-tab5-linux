@@ -23,8 +23,8 @@ if(("$ENV{BOOT_PROFILE}" STREQUAL "m2" OR
     target_compile_definitions(${COMPONENT_LIB} PRIVATE M2_SDIO=1)
 endif()
 # ES_BOARD=tab5 carries its own SDIO route (GPIO8-13 + C6 reset GPIO15),
-# two PI4IOE power expanders on the internal I2C bus, and the ST7123
-# MIPI-DSI panel.  BOARD_TAB5 selects tab5_board.c/tab5_display.c in
+# two PI4IOE power expanders on the internal I2C bus, and the ST7121 or
+# ST7123 MIPI-DSI panel.  BOARD_TAB5 selects tab5_board.c/tab5_display.c in
 # main.c and drops the Stamp OTG and GPIO42/43-48 paths entirely.  The
 # C68 profile keeps its normal SMP path: BOARD_TAB5 is deliberately not
 # tied to UP_BOOT.
