@@ -77,9 +77,9 @@ Only staged for ES_BOARD=tab5 builds (linux/build-m1.sh).
 + * the enable bit (0x101<<ch sets ch enable atomically). */
 +#define DWGDMA_CHEN_WR_EN(ch)	(0x101u << (ch))
 +
-+/* llp0 register: loc0 occupies bits [29:0] (64-byte-aligned address
-+ * >> 6); top bits carry the link-list master port -- preserved. */
-+#define DWGDMA_LLP0_LOC_MASK	0x3fffffffu
++/* llp0 register: loc0 occupies bits [31:6] (the 64-byte-aligned address
++ * itself); the low bits carry the link-list master port -- preserved. */
++#define DWGDMA_LLP0_LOC_MASK	0xffffffc0u
 +
 +/* LLI memory layout (dw_gdma_link_list_item_t, 64 bytes):
 + * sar0 at 0x00, dar0 at 0x08, ctrl_hi at 0x24 holds the valid (31)
@@ -134,7 +134,7 @@ Only staged for ES_BOARD=tab5 builds (linux/build-m1.sh).
 +	/* Re-point llp0 at the item, preserving the master-port bits. */
 +	llp = readl(s->regs + s->ch_off + DWGDMA_CH_LLP0);
 +	llp = (llp & ~DWGDMA_LLP0_LOC_MASK) |
-+	      ((s->lli_pa >> 6) & DWGDMA_LLP0_LOC_MASK);
++	      (s->lli_pa & DWGDMA_LLP0_LOC_MASK);
 +	writel(llp, s->regs + s->ch_off + DWGDMA_CH_LLP0);
 +	/* Re-enable the channel. */
 +	writel(DWGDMA_CHEN_WR_EN(s->chan), s->regs + DWGDMA_CHEN0);
