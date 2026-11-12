@@ -256,6 +256,33 @@
 			status = "disabled";
 		};
 
+		/*
+		 * DW-GDMA scanout channel handed over by the boot shim.  The
+		 * hardware clears the LLI valid bit in memory on every
+		 * block end (there is no free-run -- the channel stalls one
+		 * frame after the last re-arm), so a kernel driver re-arms
+		 * it in IRQ context, the same contract ESP-IDF's trans-done
+		 * callback and upstream dw-axi-dmac cyclic mode implement.
+		 * DW-GDMA is ETS interrupt source 24, routed to free CLIC
+		 * slot 25; the shim detaches the IDF route before the jump
+		 * and the kernel's clic_domain_map installs this one.
+		 *
+		 * espressif,scanout-lli/-chan are patched by the boot shim
+		 * (patch_scanout_node in main.c): the 64-byte link-list
+		 * item lives in internal SRAM and is found by content, not
+		 * by llp0 (which reads 0 while the channel runs).  The
+		 * placeholder values stay when the scan-out never came
+		 * up; the driver fails closed on them.
+		 */
+		dsi_scanout: dsi-scanout@50081000 {
+			compatible = "espressif,esp32p4-dsi-scanout";
+			reg = <0x50081000 0x600>;
+			interrupts-extended = <&clic0 25 24 IRQ_TYPE_LEVEL_HIGH>;
+			espressif,scanout-lli = <0x5ca11000>;
+			espressif,scanout-chan = <0x5ca12000>;
+			status = "okay";
+		};
+
 		/* Patched at runtime by boot-shim/main.c with the flash MMU VA. */
 		flash@deadbeef {
 			compatible = "mtd-rom";
