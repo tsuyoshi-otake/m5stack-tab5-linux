@@ -581,6 +581,12 @@ if mode == "ap":
     conf = (
         "update_config=0\n"
         "ap_scan=1\n\n"
+        "# Issue #4 experiment for Android joins (not for v0.1.0): uncomment\n"
+        "# to retry a phone against a plainer AP.  country= adds a Country IE\n"
+        "# to beacons and pushes the regdom to the C6.  The pairwise=/group=\n"
+        "# lines at the end of network={} come after CCMP and win, forcing\n"
+        "# WPA2-TKIP, which also drops 802.11n and bisects the C6 CCMP/HT path.\n"
+        "#country=JP\n\n"
         "network={\n"
         f"\tssid={json.dumps(ssid, ensure_ascii=False)}\n"
         "\tmode=2\n"
@@ -590,6 +596,9 @@ if mode == "ap":
         "\tpairwise=CCMP\n"
         "\tgroup=CCMP\n"
         f"\tpsk={json.dumps(psk, ensure_ascii=False)}\n"
+        "\t# issue #4 experiment: see the comment above network={}.\n"
+        "\t#pairwise=TKIP\n"
+        "\t#group=TKIP\n"
         "}\n"
     )
 else:

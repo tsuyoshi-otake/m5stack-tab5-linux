@@ -69,6 +69,13 @@ generate_credentials() {
 		update_config=0
 		ap_scan=1
 
+		# Issue #4 experiment for Android joins (not for v0.1.0): uncomment
+		# to retry a phone against a plainer AP.  country= adds a Country IE
+		# to beacons and pushes the regdom to the C6.  The pairwise=/group=
+		# lines at the end of network={} come after CCMP and win, forcing
+		# WPA2-TKIP, which also drops 802.11n and bisects the C6 CCMP/HT path.
+		#country=JP
+
 		network={
 		$(printf '\t')ssid="m5-$id"
 		$(printf '\t')mode=2
@@ -78,6 +85,9 @@ generate_credentials() {
 		$(printf '\t')pairwise=CCMP
 		$(printf '\t')group=CCMP
 		$(printf '\t')psk="$psk"
+		$(printf '\t')# issue #4 experiment: see the comment above network={}.
+		$(printf '\t')#pairwise=TKIP
+		$(printf '\t')#group=TKIP
 		}
 		EOF
 		{
