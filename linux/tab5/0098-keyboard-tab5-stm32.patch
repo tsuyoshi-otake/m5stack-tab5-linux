@@ -1,0 +1,432 @@
+From: Devin <devin@cognition.ai>
+Subject: [PATCH tab5] input: keyboard: M5Stack Tab5 Keyboard (A164)
+ I2C driver
+
+Tab5's Ext.Port1 keyboard is an STM32F030C8T6 matrix scanner at I2C
+0x6d on a dedicated hw GPIO0 (SDA) / GPIO1 (SCL) pair -- a bus of its
+own, independent of the bit-banged internal bus on GPIO31/32.
+
+HID mode is used because the MCU already owns the Aa/Sym layer state
+machine and the modifier byte: a press event is a complete
+(modifier, usage) pair, a release is (modifier, 0).  The zero-usage
+release names no key, so on release every tracked non-modifier usage
+is dropped and modifiers are re-synced from the byte; self-healing
+when a release spans several held keys.
+
+The key-ready interrupt is hw GPIO50 on gpio bank 1, which the
+esp32p4 gpio driver does not wire to an irq_chip, so the driver polls
+the chip FIFO at 40 Hz; the MCU queues events until drained.  Its two
+RGB LEDs stay in the chip's default "binding" mode, so no led device
+is registered.
+
+Wire protocol from m5stack M5Tab5-Keyboard-Internal-FW (MIT licensed):
+
+  0x00  INT_CFG    bit0/1/2 = key/hid/char event enables
+  0x01  INT_STA    pending event types; write 0 clears + releases INT
+  0x02  EVENT_NUM  queued event count; write 0 flushes the FIFO
+  0x10  KB_MODE    0=key, 1=hid, 2=char
+  0x30  HID_EVENT  pops one entry per read: [modifier, usage];
+                   usage == 0 marks a release, 0xff/0xff means empty
+  0xfe  VERSION    firmware byte
+
+Signed-off-by: Devin <devin@cognition.ai>
+---
+ drivers/input/keyboard/Kconfig   |   8 +
+ drivers/input/keyboard/Makefile  |   1 +
+ drivers/input/keyboard/tab5-kbd.c | 365 ++++++++++++++++++++++++++++++
+ 3 files changed, 362 insertions(+)
+
+diff --git a/drivers/input/keyboard/Kconfig b/drivers/input/keyboard/Kconfig
+--- a/drivers/input/keyboard/Kconfig
++++ b/drivers/input/keyboard/Kconfig
+@@ -806,4 +806,12 @@
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called cypress-sf.
+ 
++config KEYBOARD_TAB5
++	tristate "M5Stack Tab5 Keyboard (A164)"
++	depends on I2C
++	help
++	  STM32F030C8T6-based 70-key keyboard module on Tab5's Ext.Port1
++	  header; I2C slave at 0x6d reporting (modifier, usage) events
++	  in its firmware HID mode.
++
+ endif
+diff --git a/drivers/input/keyboard/Makefile b/drivers/input/keyboard/Makefile
+--- a/drivers/input/keyboard/Makefile
++++ b/drivers/input/keyboard/Makefile
+@@ -71,3 +71,4 @@
+ obj-$(CONFIG_KEYBOARD_TM2_TOUCHKEY)	+= tm2-touchkey.o
+ obj-$(CONFIG_KEYBOARD_TWL4030)		+= twl4030_keypad.o
+ obj-$(CONFIG_KEYBOARD_XTKBD)		+= xtkbd.o
++obj-$(CONFIG_KEYBOARD_TAB5)		+= tab5-kbd.o
+diff --git a/drivers/input/keyboard/tab5-kbd.c b/drivers/input/keyboard/tab5-kbd.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/input/keyboard/tab5-kbd.c
+@@ -0,0 +1,365 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * M5Stack Tab5 Keyboard (A164) I2C driver.
++ *
++ * The unit is an STM32F030C8T6 matrix scanner behind Tab5's Ext.Port1
++ * header: I2C slave at 0x6d on the dedicated hw GPIO0 (SDA) / GPIO1
++ * (SCL) pair -- a bus of its own, independent of the bit-banged
++ * internal bus on GPIO31/32.  Its key-ready interrupt is hw GPIO50 on
++ * gpio bank 1, which the esp32p4 gpio driver does not wire to an
++ * irq_chip, so events are polled from the chip FIFO at 40 Hz; the
++ * queue holds events until drained, so polling loses nothing.
++ *
++ * Wire protocol (m5stack M5Tab5-Keyboard-Internal-FW, MIT licensed):
++ *
++ *   0x00  INT_CFG    bit0/1/2 = key/hid/char event enables
++ *   0x01  INT_STA    pending event types; write 0 clears + releases INT
++ *   0x02  EVENT_NUM  queued event count; write 0 flushes the FIFO
++ *   0x10  KB_MODE    0=key, 1=hid, 2=char
++ *   0x30  HID_EVENT  pops one entry per read: [modifier, usage];
++ *                    usage == 0 marks a release, 0xff/0xff means empty
++ *   0xfe  VERSION    firmware byte
++ *
++ * HID mode is used because the MCU already owns the Aa/Sym layer
++ * state machine: each press event is a complete (modifier, usage)
++ * pair and each release is (modifier, 0).  The zero-usage release
++ * does not name a key, so on release every tracked non-modifier
++ * usage is dropped and modifiers are re-synced from the byte -- a
++ * self-healing model when several keys span a release.
++ *
++ * The MCU's two RGB LEDs stay in their default "binding" mode
++ * (key-state feedback handled on the chip), so no led device is
++ * registered here.
++ *
++ * The STM32 runs its I2C pins with no pull and the stock design
++ * relies on the host's internal pad pull-ups (the ESP-IDF demo sets
++ * enable_internal_pullup).  i2c-gpio only toggles direction, so the
++ * probe enables WPU on the two IO_MUX pads itself; the pad indices
++ * are fixed by the board wiring (hw GPIO0 = SDA, hw GPIO1 = SCL).
++ */
++
++#include <linux/bitmap.h>
++#include <linux/i2c.h>
++#include <linux/input.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/workqueue.h>
++
++#define TAB5KBD_REG_INT_CFG	0x00
++#define TAB5KBD_REG_INT_STA	0x01
++#define TAB5KBD_REG_EVENT_NUM	0x02
++#define TAB5KBD_REG_KB_MODE	0x10
++#define TAB5KBD_REG_HID_EVENT	0x30
++#define TAB5KBD_REG_VERSION	0xfe
++
++#define TAB5KBD_CFG_HID_EN	0x02
++#define TAB5KBD_STA_HID		0x02
++#define TAB5KBD_MODE_HID	0x01
++
++#define TAB5KBD_MOD_FIRST	0xe0	/* HID usages e0..e7 = modifiers */
++#define TAB5KBD_USAGE_MAX	0xe8
++#define TAB5KBD_DRAIN_MAX	32
++#define TAB5KBD_POLL_MS		25
++
++#define TAB5KBD_IOMUX_BASE	0x500e1000
++#define TAB5KBD_IOMUX_PIN(n)	(0x4 + (n) * 0x4)
++#define TAB5KBD_IOMUX_WPU	BIT(8)
++#define TAB5KBD_IOMUX_IE	BIT(9)
++
++struct tab5kbd {
++	struct i2c_client *client;
++	struct input_dev *input;
++	struct delayed_work work;
++	DECLARE_BITMAP(pressed, TAB5KBD_USAGE_MAX);
++};
++
++/* HID usage -> Linux keycode for the 0x04..0x67 range (0 = unmapped). */
++static const u16 tab5kbd_keycode[0x68] = {
++	[0x04] = KEY_A,		[0x05] = KEY_B,		[0x06] = KEY_C,
++	[0x07] = KEY_D,		[0x08] = KEY_E,		[0x09] = KEY_F,
++	[0x0a] = KEY_G,		[0x0b] = KEY_H,		[0x0c] = KEY_I,
++	[0x0d] = KEY_J,		[0x0e] = KEY_K,		[0x0f] = KEY_L,
++	[0x10] = KEY_M,		[0x11] = KEY_N,		[0x12] = KEY_O,
++	[0x13] = KEY_P,		[0x14] = KEY_Q,		[0x15] = KEY_R,
++	[0x16] = KEY_S,		[0x17] = KEY_T,		[0x18] = KEY_U,
++	[0x19] = KEY_V,		[0x1a] = KEY_W,		[0x1b] = KEY_X,
++	[0x1c] = KEY_Y,		[0x1d] = KEY_Z,
++	[0x1e] = KEY_1,		[0x1f] = KEY_2,		[0x20] = KEY_3,
++	[0x21] = KEY_4,		[0x22] = KEY_5,		[0x23] = KEY_6,
++	[0x24] = KEY_7,		[0x25] = KEY_8,		[0x26] = KEY_9,
++	[0x27] = KEY_0,
++	[0x28] = KEY_ENTER,	[0x29] = KEY_ESC,	[0x2a] = KEY_BACKSPACE,
++	[0x2b] = KEY_TAB,	[0x2c] = KEY_SPACE,	[0x2d] = KEY_MINUS,
++	[0x2e] = KEY_EQUAL,	[0x2f] = KEY_LEFTBRACE,	[0x30] = KEY_RIGHTBRACE,
++	[0x31] = KEY_BACKSLASH,	[0x32] = KEY_BACKSLASH,	[0x33] = KEY_SEMICOLON,
++	[0x34] = KEY_APOSTROPHE,[0x35] = KEY_GRAVE,	[0x36] = KEY_COMMA,
++	[0x37] = KEY_DOT,	[0x38] = KEY_SLASH,	[0x39] = KEY_CAPSLOCK,
++	[0x3a] = KEY_F1,	[0x3b] = KEY_F2,	[0x3c] = KEY_F3,
++	[0x3d] = KEY_F4,	[0x3e] = KEY_F5,	[0x3f] = KEY_F6,
++	[0x40] = KEY_F7,	[0x41] = KEY_F8,	[0x42] = KEY_F9,
++	[0x43] = KEY_F10,	[0x44] = KEY_F11,	[0x45] = KEY_F12,
++	[0x46] = KEY_SYSRQ,	[0x47] = KEY_SCROLLLOCK,	[0x48] = KEY_PAUSE,
++	[0x49] = KEY_INSERT,	[0x4a] = KEY_HOME,	[0x4b] = KEY_PAGEUP,
++	[0x4c] = KEY_DELETE,	[0x4d] = KEY_END,	[0x4e] = KEY_PAGEDOWN,
++	[0x4f] = KEY_RIGHT,	[0x50] = KEY_LEFT,	[0x51] = KEY_DOWN,
++	[0x52] = KEY_UP,
++	[0x53] = KEY_NUMLOCK,	[0x54] = KEY_KPSLASH,	[0x55] = KEY_KPASTERISK,
++	[0x56] = KEY_KPMINUS,	[0x57] = KEY_KPPLUS,	[0x58] = KEY_KPENTER,
++	[0x59] = KEY_KP1,	[0x5a] = KEY_KP2,	[0x5b] = KEY_KP3,
++	[0x5c] = KEY_KP4,	[0x5d] = KEY_KP5,	[0x5e] = KEY_KP6,
++	[0x5f] = KEY_KP7,	[0x60] = KEY_KP8,	[0x61] = KEY_KP9,
++	[0x62] = KEY_KP0,	[0x63] = KEY_KPDOT,
++	[0x64] = KEY_102ND,	[0x65] = KEY_COMPOSE,	[0x66] = KEY_POWER,
++	[0x67] = KEY_KPEQUAL,
++};
++
++/* HID usages e0..e7 reported in the modifier byte. */
++static const u16 tab5kbd_modifier_keycode[8] = {
++	KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_LEFTALT, KEY_LEFTMETA,
++	KEY_RIGHTCTRL, KEY_RIGHTSHIFT, KEY_RIGHTALT, KEY_RIGHTMETA,
++};
++
++static u16 tab5kbd_code(u8 usage)
++{
++	if (usage >= TAB5KBD_MOD_FIRST && usage < TAB5KBD_USAGE_MAX)
++		return tab5kbd_modifier_keycode[usage - TAB5KBD_MOD_FIRST];
++	if (usage < ARRAY_SIZE(tab5kbd_keycode))
++		return tab5kbd_keycode[usage];
++	return 0;
++}
++
++/*
++ * Enable the host-side pad pull-ups the keyboard's bus design
++ * expects.  Must run before the first transaction on the bus.
++ */
++static void tab5kbd_pull_up_pads(struct device *dev)
++{
++	static const u8 pads[2] = { 0, 1 }; /* hw GPIO0 SDA, GPIO1 SCL */
++	void __iomem *iomux;
++	int i;
++
++	iomux = devm_ioremap(dev, TAB5KBD_IOMUX_BASE, 0x100);
++	if (!iomux) {
++		dev_warn(dev, "iomux map failed; bus relies on stray pulls\n");
++		return;
++	}
++	for (i = 0; i < ARRAY_SIZE(pads); i++) {
++		u32 v = readl(iomux + TAB5KBD_IOMUX_PIN(pads[i]));
++
++		writel(v | TAB5KBD_IOMUX_WPU | TAB5KBD_IOMUX_IE,
++		       iomux + TAB5KBD_IOMUX_PIN(pads[i]));
++	}
++}
++
++static int tab5kbd_read(struct i2c_client *client, u8 reg,
++			u8 *data, u8 len)
++{
++	struct i2c_msg msgs[] = {
++		{
++			.addr = client->addr,
++			.flags = 0,
++			.len = 1,
++			.buf = &reg,
++		}, {
++			.addr = client->addr,
++			.flags = I2C_M_RD,
++			.len = len,
++			.buf = data,
++		},
++	};
++
++	if (i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs)) !=
++	    ARRAY_SIZE(msgs))
++		return -EIO;
++	return 0;
++}
++
++static int tab5kbd_write(struct i2c_client *client, u8 reg, u8 val)
++{
++	u8 buf[2] = { reg, val };
++
++	return i2c_master_send(client, buf, sizeof(buf)) == sizeof(buf) ?
++	       0 : -EIO;
++}
++
++static void tab5kbd_event(struct tab5kbd *kbd, u8 modifier, u8 usage)
++{
++	struct input_dev *input = kbd->input;
++	unsigned int i;
++	unsigned long bit;
++
++	if (usage) {
++		u16 code = tab5kbd_code(usage);
++
++		if (code && !test_and_set_bit(usage, kbd->pressed)) {
++			input_event(input, EV_MSC, MSC_SCAN, usage);
++			input_report_key(input, code, 1);
++		}
++	} else {
++		/*
++		 * A zero usage is a bare release with no key identity:
++		 * drop every tracked non-modifier usage, then let the
++		 * modifier sync below re-assert what the byte still
++		 * reports as held.
++		 */
++		for_each_set_bit(bit, kbd->pressed, TAB5KBD_MOD_FIRST) {
++			input_event(input, EV_MSC, MSC_SCAN, bit);
++			input_report_key(input, tab5kbd_keycode[bit], 0);
++		}
++		bitmap_clear(kbd->pressed, 0, TAB5KBD_MOD_FIRST);
++	}
++	for (i = 0; i < 8; i++) {
++		unsigned int mod = TAB5KBD_MOD_FIRST + i;
++
++		if (modifier & BIT(i)) {
++			if (!test_and_set_bit(mod, kbd->pressed)) {
++				input_event(input, EV_MSC, MSC_SCAN, mod);
++				input_report_key(input,
++						 tab5kbd_modifier_keycode[i], 1);
++			}
++		} else if (test_and_clear_bit(mod, kbd->pressed)) {
++			input_event(input, EV_MSC, MSC_SCAN, mod);
++			input_report_key(input,
++					 tab5kbd_modifier_keycode[i], 0);
++		}
++	}
++}
++
++static void tab5kbd_drain(struct tab5kbd *kbd)
++{
++	struct i2c_client *client = kbd->client;
++	u8 sta[2], ev[2];
++	unsigned int i;
++
++	/* 0x01 reads [INT_STA, EVENT_NUM] in one transaction. */
++	if (tab5kbd_read(client, TAB5KBD_REG_INT_STA, sta, sizeof(sta)) < 0)
++		return;
++	if (!(sta[0] & TAB5KBD_STA_HID) || !sta[1])
++		return;
++	if (sta[1] > TAB5KBD_DRAIN_MAX)
++		sta[1] = TAB5KBD_DRAIN_MAX;
++	for (i = 0; i < sta[1]; i++) {
++		if (tab5kbd_read(client, TAB5KBD_REG_HID_EVENT, ev,
++				 sizeof(ev)) < 0)
++			break;
++		if (ev[0] == 0xff && ev[1] == 0xff)
++			break;
++		tab5kbd_event(kbd, ev[0], ev[1]);
++	}
++	/* Clears pending bits and releases the INT line. */
++	tab5kbd_write(client, TAB5KBD_REG_INT_STA, 0);
++	input_sync(kbd->input);
++}
++
++static void tab5kbd_poll(struct work_struct *work)
++{
++	struct tab5kbd *kbd = container_of(to_delayed_work(work),
++					   struct tab5kbd, work);
++
++	tab5kbd_drain(kbd);
++	schedule_delayed_work(&kbd->work, msecs_to_jiffies(TAB5KBD_POLL_MS));
++}
++
++static int tab5kbd_probe(struct i2c_client *client)
++{
++	struct tab5kbd *kbd;
++	struct input_dev *input;
++	u8 version = 0;
++	int error, i;
++
++	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C))
++		return dev_err_probe(&client->dev, -ENXIO,
++				     "adapter lacks plain I2C\n");
++
++	tab5kbd_pull_up_pads(&client->dev);
++
++	error = tab5kbd_read(client, TAB5KBD_REG_VERSION, &version, 1);
++	if (error)
++		return dev_err_probe(&client->dev, error,
++				     "no keyboard answer at 0x%02x\n",
++				     client->addr);
++
++	kbd = devm_kzalloc(&client->dev, sizeof(*kbd), GFP_KERNEL);
++	if (!kbd)
++		return -ENOMEM;
++	kbd->client = client;
++	i2c_set_clientdata(client, kbd);
++	INIT_DELAYED_WORK(&kbd->work, tab5kbd_poll);
++
++	input = devm_input_allocate_device(&client->dev);
++	if (!input)
++		return -ENOMEM;
++	kbd->input = input;
++	input->name = "tab5-keyboard";
++	input->phys = "tab5-kbd/input0";
++	input->id.bustype = BUS_I2C;
++	input->id.vendor = 0x06d;
++	input->id.version = version;
++	input->dev.parent = &client->dev;
++	input_set_drvdata(input, kbd);
++
++	__set_bit(EV_KEY, input->evbit);
++	__set_bit(EV_REP, input->evbit);
++	input_set_capability(input, EV_MSC, MSC_SCAN);
++	for (i = 0; i < ARRAY_SIZE(tab5kbd_keycode); i++)
++		if (tab5kbd_keycode[i])
++			__set_bit(tab5kbd_keycode[i], input->keybit);
++	for (i = 0; i < 8; i++)
++		__set_bit(tab5kbd_modifier_keycode[i], input->keybit);
++
++	error = input_register_device(input);
++	if (error)
++		return dev_err_probe(&client->dev, error,
++				     "input device registration failed\n");
++
++	/*
++	 * Configure the MCU only after the input device exists: HID mode,
++	 * FIFO flushed, hid events enabled, status cleared so INT drops.
++	 */
++	error = tab5kbd_write(client, TAB5KBD_REG_KB_MODE,
++			      TAB5KBD_MODE_HID);
++	if (!error)
++		error = tab5kbd_write(client, TAB5KBD_REG_EVENT_NUM, 0);
++	if (!error)
++		error = tab5kbd_write(client, TAB5KBD_REG_INT_CFG,
++				      TAB5KBD_CFG_HID_EN);
++	if (!error)
++		error = tab5kbd_write(client, TAB5KBD_REG_INT_STA, 0);
++	if (error)
++		return dev_err_probe(&client->dev, error,
++				     "keyboard configuration failed\n");
++
++	dev_info(&client->dev,
++		 "tab5-keyboard: fw 0x%02x, polling at %d Hz\n", version,
++		 1000 / TAB5KBD_POLL_MS);
++	schedule_delayed_work(&kbd->work, msecs_to_jiffies(TAB5KBD_POLL_MS));
++	return 0;
++}
++
++static void tab5kbd_remove(struct i2c_client *client)
++{
++	struct tab5kbd *kbd = i2c_get_clientdata(client);
++
++	cancel_delayed_work_sync(&kbd->work);
++}
++
++static const struct of_device_id tab5kbd_of_match[] = {
++	{ .compatible = "m5stack,tab5-keyboard" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, tab5kbd_of_match);
++
++static struct i2c_driver tab5kbd_driver = {
++	.driver = {
++		.name = "tab5-keyboard",
++		.of_match_table = tab5kbd_of_match,
++	},
++	.probe = tab5kbd_probe,
++	.remove = tab5kbd_remove,
++};
++module_i2c_driver(tab5kbd_driver);
++
++MODULE_AUTHOR("Devin <devin@cognition.ai>");
++MODULE_DESCRIPTION("M5Stack Tab5 Keyboard (A164) I2C driver");
++MODULE_LICENSE("GPL");

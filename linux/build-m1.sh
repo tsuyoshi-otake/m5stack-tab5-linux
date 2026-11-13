@@ -1240,6 +1240,12 @@ CONFIG_INPUT=y
 CONFIG_INPUT_EVDEV=y
 CONFIG_INPUT_TOUCHSCREEN=y
 CONFIG_TOUCHSCREEN_ST7123=y
+# Ext.Port1 A164 keyboard: STM32 at 0x6d on the dedicated hw GPIO0/1
+# pair (linux/tab5/0098); polled -- its bank-1 INT has no irq_chip.
+# INPUT_KEYBOARD is spelled out because CONFIG_EXPERT drops its
+# default y.
+CONFIG_INPUT_KEYBOARD=y
+CONFIG_KEYBOARD_TAB5=y
 EOF
 fi
 if [[ -n "$pstore_identity" ]]; then

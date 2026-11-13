@@ -366,6 +366,31 @@
 		};
 	};
 
+	/*
+	 * Ext.Port1 keyboard bus: the A164 unit is an STM32F030C8T6
+	 * matrix scanner at 0x6d on a dedicated hw GPIO0 (SDA) /
+	 * GPIO1 (SCL) pair -- a bus of its own, independent of the
+	 * internal bus above, so a wedge there cannot strand it.
+	 * Its INT is hw GPIO50 on bank 1, which the esp32p4 gpio
+	 * driver does not wire to an irq_chip, so the driver polls
+	 * the chip FIFO instead of describing the line here.
+	 */
+	i2c1: i2c-gpio-1 {
+		compatible = "i2c-gpio";
+		#address-cells = <1>;
+		#size-cells = <0>;
+		gpios = <&gpio0 0 GPIO_ACTIVE_HIGH>,	/* SDA */
+			<&gpio0 1 GPIO_ACTIVE_HIGH>;	/* SCL */
+		i2c-gpio,delay-us = <5>;
+		status = "okay";
+
+		keyboard@6d {
+			compatible = "m5stack,tab5-keyboard";
+			reg = <0x6d>;
+			status = "okay";
+		};
+	};
+
 	reserved-memory {
 		#address-cells = <1>;
 		#size-cells = <1>;
