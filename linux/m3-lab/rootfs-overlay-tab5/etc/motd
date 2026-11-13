@@ -14,3 +14,5 @@ Commands
   other    python3 (MicroPython)  hexdump xxd md5sum sha256sum date bc
 
 Full list: busybox --list ; busybox-tools --list
+
+wifi-qr (root) draws the SoftAP QR on the panel -- first boot shows it.

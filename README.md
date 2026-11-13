@@ -154,6 +154,8 @@ cat /tmp/credentials.txt
 
 `ssid=` (`m5-XXXX`) and `psk=` are the SoftAP, `password=` is the SSH and console password of user `m5`, and `root_password=` is what `su` asks for. **The serial log then contains the passwords; redact that line before you share logs.** There is no shared default: every board gets its own.
 
+On that first boot only, the panel shows the SoftAP credentials as a QR code for fifteen minutes — point a phone camera at it to join `m5-XXXX`. To show it again later, run as root: `wifi-qr --panel --for 60` (or `wifi-qr > /dev/tty0` for a text QR); `wifi-qr --clear` erases it.
+
 ### 5. Connect over Wi-Fi
 
 1. Join the Wi-Fi network `m5-XXXX` (WPA2-PSK, 2.4 GHz) with the `psk=` from `credentials.txt`.

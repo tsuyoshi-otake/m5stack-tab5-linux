@@ -2366,8 +2366,16 @@ if $lab_profile; then
 	# PR_SET_SYSTEM_WORK wrapper so system scripts keep system-side
 	# NOMMU classification when a user starts them (#50 round 4).
 	set_config_value "${br_output}/.config" BR2_PACKAGE_RUN_SYSTEM y
+	# First-boot SoftAP credentials QR on the Tab5 panel (#4).  The
+	# package only exists on Tab5 builds.
+	if [[ "$board" == tab5 ]]; then
+		set_config_value "${br_output}/.config" BR2_PACKAGE_WIFI_QR y
+	else
+		set_config_value "${br_output}/.config" BR2_PACKAGE_WIFI_QR "# BR2_PACKAGE_WIFI_QR is not set"
+	fi
 else
 	set_config_value "${br_output}/.config" BR2_PACKAGE_BOOT_COMMIT "# BR2_PACKAGE_BOOT_COMMIT is not set"
+	set_config_value "${br_output}/.config" BR2_PACKAGE_WIFI_QR "# BR2_PACKAGE_WIFI_QR is not set"
 fi
 set_config_value "${br_output}/.config" BR2_ROOTFS_OVERLAY "\"${rootfs_overlay}\""
 set_config_value "${br_output}/.config" BR2_ROOTFS_POST_BUILD_SCRIPT "\"${post_build_scripts}\""
@@ -2616,6 +2624,16 @@ if $ssh_profile; then
 				exit 1
 			}
 		done
+		if [[ "$board" == tab5 ]]; then
+			grep -Fqx -- "BR2_PACKAGE_WIFI_QR=y" "${br_output}/.config" || {
+				echo "m3-lab config check failed: BR2_PACKAGE_WIFI_QR=y" >&2
+				exit 1
+			}
+			[[ -x "${br_output}/target/usr/bin/wifi-qr" ]] || {
+				echo "m3-lab check failed: wifi-qr missing" >&2
+				exit 1
+			}
+		fi
 		for opt in INETD SYSLOGD UDHCPD; do
 			grep -Fqx -- "# CONFIG_${opt} is not set" \
 				"${br_output}"/build/busybox-[0-9]*/.config || {

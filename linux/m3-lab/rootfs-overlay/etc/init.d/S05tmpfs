@@ -412,6 +412,12 @@ EOF
 				es_log "ES_CREDENTIALS FAIL: could not add root_password= to /boot/credentials.txt"
 			fi
 		fi
+		# default-hostname exists only in the Tab5 overlay (#1): the
+		# marker lets Tab5's S50wifiqr show the SoftAP QR on the panel
+		# only when this boot generated credentials (#4).
+		if [ "$CRED_NEW" = 1 ] && [ -e /etc/board/default-hostname ]; then
+			: > /run/.es-creds-new
+		fi
 		apply_password /boot/credentials.txt || true
 		apply_root_password /boot/credentials.txt || true
 		install_keys /boot/authorized_keys || true
