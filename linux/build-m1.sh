@@ -2292,6 +2292,11 @@ if $ssh_profile; then
 	if $lab_profile; then
 		rootfs_overlay="${rootfs_overlay} ${lab_stage}/rootfs-overlay"
 		rootfs_overlay="${rootfs_overlay} ${lab_provision_stage}"
+		# The generic lab login banner describes the Stamp's USB drive
+		# (credentials.txt, autorun), which the Tab5 does not have.
+		if [[ "$board" == tab5 ]]; then
+			rootfs_overlay="${rootfs_overlay} ${lab_stage}/rootfs-overlay-tab5"
+		fi
 		post_build_scripts="${post_build_scripts} ${lab_stage}/post-build.sh"
 		users_table="${lab_stage}/users.txt"
 		busybox_fragments="${busybox_fragments} ${lab_stage}/busybox.fragment"

@@ -1,14 +1,14 @@
 {
   "schema": 1,
-  "status": "candidate_not_validated",
-  "board": "M5Stack Tab5 WIP (tab5 bring-up, m3 feature profile)",
+  "status": "ready_for_flash",
+  "board": "M5Stack Tab5 (m3 feature profile)",
   "base_layout": "../m2/flash-layout.json",
   "flash_bytes": 16777216,
   "alignment_bytes": 4096,
-  "write_gate": "NOT VALIDATED - do not flash until hardware readback confirms the map against the Tab5 stock dump",
+  "write_gate": "P4 only. Keep a dump of the stock flash (esptool read_flash 0 0x1000000) before the first write; the C6 is not part of this map and is never written by the image flash.",
   "evidence": {
     "stock_dump": "../../m5stack-tab5-linux-images/stock-2026-11-10 (SHA256SUMS.txt, boot-log.txt, live-log.txt, tab5-stock.bin)",
-    "note": "Tab5 uses the same 16 MiB flash as the validated Stamp image; offsets below mirror the Stamp M2 map byte for byte so the A/B boot and crashlog machinery is unchanged.  Nothing here has been flashed or read back on Tab5 hardware."
+    "note": "Tab5 uses the same 16 MiB flash as the validated Stamp image; offsets below mirror the Stamp M2 map byte for byte so the A/B boot and crashlog machinery is unchanged.  This map was written to a Tab5 with esptool in builds 1-9 (2026-11-12 and 2026-11-13) and Linux booted from it each time; the release image is validated in linux/tests/tab5-hardware-validation-*.md."
   },
   "load_addresses": {
     "kernel_psram": "0x48000000",

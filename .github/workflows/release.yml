@@ -20,6 +20,12 @@ on:
 permissions:
   contents: write
   actions: read
+env:
+  # The board this repository releases for.  build-m1.sh and package-release.py
+  # read ES_BOARD; ASSET_PREFIX is what package-release.py names the assets
+  # for it (m5stack-tab5-linux-smp-<version>-*).
+  ES_BOARD: tab5
+  ASSET_PREFIX: m5stack-tab5-linux-smp
 jobs:
   build:
     if: github.event_name == 'workflow_dispatch'
@@ -57,7 +63,7 @@ jobs:
         run: |
           VERSION=${{ github.event.inputs.version }}
           VERSION=${VERSION%%-*}
-          python3 linux/tools/package-release.py \
+          python3 linux/tools/package-release.py --board "$ES_BOARD" \
             --build-output "$RUNNER_TEMP/out" \
             --boot-image "$RUNNER_TEMP/out/buildroot/images/boot.img" \
             --output release --version "$VERSION"
@@ -75,8 +81,8 @@ jobs:
             h="$src/linux-headers-custom/${t##*/}"
             if [ -f "$h" ] && cmp -s "$t" "$h"; then ln -f "$t" "$h"; fi
           done
-          cp LICENSE "$RUNNER_TEMP/out/buildroot/legal-info/LICENSE.m5stamp-p4-c6-linux"
-          tar -czf "release/m5stamp-p4-c6-linux-smp-$VERSION-legal-info.tar.gz" \
+          cp LICENSE "$RUNNER_TEMP/out/buildroot/legal-info/LICENSE.m5stack-tab5-linux"
+          tar -czf "release/$ASSET_PREFIX-$VERSION-legal-info.tar.gz" \
             -C "$RUNNER_TEMP/out/buildroot" --exclude=legal-info/host-sources legal-info
           ls -l release/*-legal-info.tar.gz
       - uses: actions/upload-artifact@v4
@@ -119,7 +125,7 @@ jobs:
           fi
           gh run download "$run" -n release-assets -D release
           ls -l release
-          test -f "release/m5stamp-p4-c6-linux-smp-$VERSION-16mb.bin.gz" || {
+          test -f "release/$ASSET_PREFIX-$VERSION-16mb.bin.gz" || {
             echo "run $run was not built as $VERSION" >&2
             exit 1
           }
