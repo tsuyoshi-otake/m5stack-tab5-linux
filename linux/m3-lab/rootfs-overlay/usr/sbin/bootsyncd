@@ -56,12 +56,32 @@ find_lun_file() {
 	[ "$n" -eq 1 ] || LUN_FILE=""
 }
 
+# No LUN file: a board without a USB gadget (the Tab5), or a gadget that is being
+# re-attached.  $LUN_CTL can only say why, so it is run at most once per
+# LUN_RETRY_TICKS polls and its answer is read back from a file.  $(...) must
+# not be used here: the NOMMU hush leaks 8-12 KB of heap on every command
+# substitution, which used to exhaust the 10 MB pool within hours on a board
+# that never has a LUN file (Tab5 #3).  The glob above still runs every tick, so
+# a gadget that appears later is noticed at once.
+LUN_RETRY=0
+LUN_RETRY_TICKS=30
+LUN_OUT=/run/.lunout
 lun_state() {
 	[ -n "$LUN_FILE" ] && [ -f "$LUN_FILE" ] || find_lun_file
 	if [ -z "$LUN_FILE" ]; then
-		LUN_STATE=$($LUN_CTL state 2>/dev/null) || LUN_STATE="error"
+		if [ "$LUN_RETRY" -gt 0 ]; then
+			LUN_RETRY=$((LUN_RETRY - 1))
+			return
+		fi
+		LUN_RETRY=$LUN_RETRY_TICKS
+		if $LUN_CTL state > "$LUN_OUT" 2>/dev/null; then
+			read -r LUN_STATE < "$LUN_OUT" 2>/dev/null || LUN_STATE="error"
+		else
+			LUN_STATE="error"
+		fi
 		return
 	fi
+	LUN_RETRY=0
 	b=""
 	read -r b < "$LUN_FILE" 2>/dev/null || true
 	case "$b" in
