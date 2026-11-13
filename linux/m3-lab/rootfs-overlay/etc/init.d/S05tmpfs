@@ -349,11 +349,21 @@ start() {
 			cp -f /etc/board/wpa_supplicant.conf /boot/wpa_supplicant.conf 2>/dev/null || true
 		fi
 		if [ ! -f /boot/config.txt ]; then
-			cat << 'EOF' > /boot/config.txt 2>/dev/null || true
-# Stamp-P4 Boot & Hardware Configuration
-# Device: M5Stamp ESP32-P4 + C6 SDIO (Stamp-P4)
+			# /etc/board/default-hostname exists only in the Tab5 overlay; a
+			# Stamp rootfs keeps the Stamp header and stamp-p4 byte-identical.
+			def_host=stamp-p4
+			dev_hdr='# Stamp-P4 Boot & Hardware Configuration
+# Device: M5Stamp ESP32-P4 + C6 SDIO (Stamp-P4)'
+			if [ -r /etc/board/default-hostname ]; then
+				read -r def_host < /etc/board/default-hostname 2>/dev/null || true
+				def_host=${def_host:-tab5}
+				dev_hdr='# Tab5 Boot & Hardware Configuration
+# Device: M5Stack Tab5 (ESP32-P4 + C6 SDIO)'
+			fi
+			cat << EOF > /boot/config.txt 2>/dev/null || true
+${dev_hdr}
 # hostname is applied at boot by S40network.
-hostname=stamp-p4
+hostname=${def_host}
 # wifi_mode: ap or sta.  Leave unset to auto-detect from mode=2 in wpa_supplicant.conf.
 #wifi_mode=ap
 # wifi_ssid/wifi_psk replace wpa_supplicant.conf (station, or SoftAP with wifi_mode=ap).
