@@ -872,6 +872,10 @@ if [[ "${C68_CLEAN_RELEASE:-0}" == "1" ]]; then
 	patches+=(0041-esp32p4-ipi-driver.patch)
 	patches+=(0042-esp32p4-systimer-cpu1.patch)
 	patches+=(0066-esp32p4-clic-smp-routing.patch)
+	# Tab5 #6: the boot shim leaves its own interrupt routes behind (the
+	# brown-out detector on slot 16, the CPU0 IPI slot); drop them when the
+	# CLIC initializes.  Builds on 0066's two matrix banks.
+	patches+=(0098-esp32p4-clic-drop-boot-routes.patch)
 	patches+=(0067-esp32p4-cache-sync-smp-lock.patch)
 	# #5 diagnostic: report a CPU that stops taking interrupts (ES_DEAF).
 	if [[ "${C68_DEAF_TRACE:-0}" == "1" ]]; then
