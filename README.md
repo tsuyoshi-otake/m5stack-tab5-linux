@@ -20,7 +20,10 @@ Checked on a Tab5 (ESP32-P4 rev v1.3, ST7121 panel), with the issue where the re
 | :--- | :--- |
 | Boot | Linux 7.2.11 SMP boots to the shell on both cores (`/sys/devices/system/cpu/online` = `0-1`) on the USB-C serial console (#1, #2). |
 | Wi-Fi hardware | The C6 runs ESP-Hosted-NG 1.0.6 (`NG-1.0.6.0.1`); the kernel logs `mmc0: new SDIO card` and `wlan0` appears (#1). |
-| SoftAP + DHCP | `iw dev wlan0 info` reports `type AP`. A Linux station (a Stamp-P4) joined with WPA2, got a lease with gateway and DNS, and pinged the board and back (#4). |
+| SoftAP + DHCP | `iw dev wlan0 info` reports `type AP`. A Linux station (a Stamp-P4) joined with WPA2, got a lease with gateway and DNS, and pinged the board and back (#4). An Android 15 phone joined with the SoftAP's name and key and had an address, gateway and DNS within about 4 s (#4, #9). |
+| Wi-Fi QR code | On the first boot the panel shows a QR code for the SoftAP for fifteen minutes. A camera read it back as the board's SSID and key; it clears itself, and it does not come back on the next boot (#9). |
+| SSH over Wi-Fi | `m5` logged in with its password through the SoftAP, relayed by the phone above (#4). |
+| Hostname | A fresh boot drive names the board `tab5` (#12). |
 | Display | Text console on the panel through fbcon (`TER16x32`, 45x40 characters), confirmed by eye (#2). Kernel messages at boot are not shown (`loglevel=4`). A program can also draw through an `mmap` of `/dev/fb0`: four colour bands painted that way by `linux/tests/fb-mmap-test.c` showed on the panel and read back intact (#15). |
 | Touch | The panel's touch controller (I2C 0x55, up to 10 points) appears as `/dev/input/event0`; two fingers and the four corners were checked on the board (#2). |
 | Keyboard | The Tab5 Keyboard (A164, I2C 0x6d) types on the panel console. Letters, `Aa` tapped once and held, the `sym` layer and two keys held together were typed on the board and read back from `/dev/input`; the left LED was checked by eye (#14). The `Aa` lock and plugging the keyboard in while Linux runs are covered by the host test only. |
@@ -29,8 +32,8 @@ Checked on a Tab5 (ESP32-P4 rev v1.3, ST7121 panel), with the issue where the re
 
 Not verified, or not there yet:
 
-- **Joining the SoftAP from a phone.** An Android phone sat on "connecting" before the DHCP server handed out a gateway and DNS (#4). Whether it joins now has not been confirmed.
-- **Logging in over SSH through Wi-Fi.** Dropbear answers with its banner on the loopback interface; a login over the air has not been tested.
+- **Reaching the board from a phone that also has mobile data.** The SoftAP has no internet, so Android keeps mobile data as its default network: on the phone above, a plain `ping` or connection to 192.168.4.1 went out over LTE and failed, while `ping -I wlan0` reached the board. An SSH app on such a phone will likely fail the same way; turn mobile data off while you use the board. The phone joined from its shell (`cmd wifi connect-network`), not by scanning the QR code with its own camera.
+- **iPhone, and joining from the QR code with a phone camera**, have not been tried.
 - **Station mode** (joining your own Wi-Fi) has not been tried on the Tab5.
 - **Other panel lots.** Tab5 units ship with an ST7121 or an ST7123 display, and the oldest ones with an ILI9881C + GT911. The boot shim tells them apart by the touch controller at I2C 0x55; it carries the ST7123 init table from the stock BSP, but that path was never run. The ILI9881C/GT911 panel is not supported: the shim logs it, the display stays off and Linux boots headless on the serial console.
 - **Not ported:** audio (ES8388, ES7210, speaker), camera, IMU, power monitor, RTC, microSD, USB host and device (the USB-C port is the serial console), battery and charge control, and the buttons. The boot shim puts the I/O expanders into a safe state (speaker, camera and USB off, C6 supply on) and nothing in Linux touches them afterwards.
