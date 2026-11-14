@@ -408,8 +408,12 @@
 		keyboard@6d {
 			compatible = "m5stack,tab5-keyboard";
 			reg = <0x6d>;
-			/* Both indicator LEDs off (Caps state and mode colour). */
-			m5stack,led-brightness = <0>;
+			/*
+			 * How bright the Aa (upper case) LED is when lit,
+			 * 0..100; 20 is the keyboard's own default.  The
+			 * mode LED next to it is always dark.
+			 */
+			m5stack,led-brightness = <20>;
 			status = "okay";
 		};
 	};
