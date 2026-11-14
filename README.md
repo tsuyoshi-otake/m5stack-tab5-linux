@@ -23,6 +23,7 @@ Checked on a Tab5 (ESP32-P4 rev v1.3, ST7121 panel), with the issue where the re
 | SoftAP + DHCP | `iw dev wlan0 info` reports `type AP`. A Linux station (a Stamp-P4) joined with WPA2, got a lease with gateway and DNS, and pinged the board and back (#4). |
 | Display | Text console on the panel through fbcon (`TER16x32`, 45x40 characters), confirmed by eye (#2). Kernel messages at boot are not shown (`loglevel=4`). |
 | Touch | The panel's touch controller (I2C 0x55, up to 10 points) appears as `/dev/input/event0`; two fingers and the four corners were checked on the board (#2). |
+| Keyboard | The Tab5 Keyboard (A164, I2C 0x6d) types on the panel console. Letters, `Aa` tapped once and held, the `sym` layer and two keys held together were typed on the board and read back from `/dev/input`; the left LED was checked by eye (#14). The `Aa` lock and plugging the keyboard in while Linux runs are covered by the host test only. |
 | MicroPython | `python3` runs (v1.22.2). |
 | Memory | The NOMMU user pool grew by 8 KB over a 32 minute soak. A leak in `bootsyncd` that exhausted the pool within hours on this board is fixed (#3). |
 
@@ -175,6 +176,22 @@ On that first boot only, the panel shows the SoftAP credentials as a QR code for
 Root over SSH is key-only; on the Stamp that needs a file on the USB drive, which the Tab5 does not have.
 
 For everything the userland shares with the Stamp-P4 build (the shell, `vi`, MicroPython, joining another Wi-Fi network, the `/boot` configuration files, Deep Sleep), see the [Stamp-P4 README](https://github.com/tsuyoshi-otake/m5stamp-p4-c6-linux#readme). Its USB-drive instructions do not apply here, and none of it has been re-tested on the Tab5 except where [Status](#status-v010) says so. Serial access, troubleshooting and recovery tips are in [docs/troubleshooting.md](docs/troubleshooting.md).
+
+### 6. Keyboard (optional)
+
+The M5Stack Tab5 Keyboard (A164) types on the panel console. Plug it in before or after power-on; the kernel logs `tab5-keyboard: attached` within a second, and unplugging it releases every key it was holding.
+
+The keys work as they do with M5Stack's own firmware:
+
+| Key | What it does |
+| :--- | :--- |
+| `sym`, held | The symbol keys type their second character (`!` becomes `?`, `(` becomes `<`, `.` becomes `,`). |
+| `Aa`, one tap | The next letter is upper case. The left LED blinks until you type it. |
+| `Aa`, two taps | Letters stay upper case until you tap `Aa` again. The left LED stays lit. |
+| `Aa`, held | A Shift key for letters. |
+| `ctrl`, `alt` | As on a PC keyboard: `ctrl` + `c` stops a program. |
+
+The right LED, which the keyboard lights all the time on its own, is kept dark. The left LED's brightness is `m5stack,led-brightness` (0–100, 0 for off) in `linux/dts/esp32p4-tab5.dts`.
 
 ---
 
