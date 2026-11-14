@@ -33,11 +33,25 @@ def main() -> None:
     s05 = read("linux/m3-lab/rootfs-overlay/etc/init.d/S05tmpfs")
     build = read("linux/build-m1.sh")
 
-    # The Tab5 has no USB gadget, so its README must not carry the Stamp's
-    # drive flow (eject, autorun); the Stamp's motd and scripts below stay.
+    # README content is allowed to differ per board, so which board this
+    # repository documents is taken from the release workflow's ES_BOARD
+    # (Tab5 sets it explicitly; the Stamp repo leaves the stamp-p4 default).
+    release_yml = read(".github/workflows/release.yml")
+    is_tab5 = "ES_BOARD: tab5" in release_yml
     assert "Reboot Persistence" not in readme
-    assert "Eject / Safely Remove" not in readme
-    assert "Autorun from the USB drive" not in readme
+    if is_tab5:
+        # The Tab5 has no USB gadget, so its README must not carry the
+        # Stamp's drive flow (eject, autorun).
+        assert "Eject / Safely Remove" not in readme
+        assert "Autorun from the USB drive" not in readme
+    else:
+        # The Stamp-P4 README documents the USB drive flow the board has.
+        assert "Eject / Safely Remove" in readme
+        assert "Saved to flash" in readme
+        assert "inactive flash slot" in readme
+        assert "No eject or reboot is needed" in readme
+        assert "riscv32-linux-gcc -Os -fPIC -Wl,-elf2flt" in readme
+        assert "### 5. Autorun from the USB drive (Pico-style)" in readme
 
     assert "\t\tdevice-owned)\n\t\t\tIMPORT_MODE=eject\n" in bootsync
     assert "mount -t vfat -o ro,loop" in bootsync
