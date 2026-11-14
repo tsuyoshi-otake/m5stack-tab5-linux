@@ -94,7 +94,7 @@ Unzip the package and run, from the folder:
 .\flash-candidate.ps1 -Port COM13 -AllowCandidateWrite -StockReadback ..\tab5-stock.bin
 ```
 
-It checks the artifact sizes, writes the bootloader, partition table, boot shim, kernel, root filesystem and DTB, and verifies them. The boot slots (`/boot` with your Wi-Fi settings and credentials) and the A/B metadata are kept by default; `-WriteBoot` writes `boot.img` and resets the A/B choice (needed the first time). `-StockReadback` is optional: it makes the script check that the file is a 16 MiB dump with the SHA-256 `a260eda9…` of the author's unit, so pass `-ExpectedStockSha256 <hash>` with the hash of your own dump, or leave it out.
+Write with this script rather than calling esptool directly: it prints each artifact's SHA-256 and the kernel build it wrote (`Expect after boot: uname -v = …`), so the booted image can be reconciled against what was written. It checks the artifact sizes, writes the bootloader, partition table, boot shim, kernel, root filesystem and DTB, verifies them, and resets the board so Linux boots (pass `-NoReset` to leave it in download mode instead). The boot slots (`/boot` with your Wi-Fi settings and credentials) and the A/B metadata are kept by default; `-WriteBoot` writes `boot.img` and resets the A/B choice (needed the first time). `-StockReadback` is optional: it makes the script check that the file is a 16 MiB dump with the SHA-256 `a260eda9…` of the author's unit, so pass `-ExpectedStockSha256 <hash>` with the hash of your own dump, or leave it out.
 
 The first install needs `-WriteBoot` so that the boot FAT image exists:
 
@@ -226,11 +226,10 @@ cd m5stack-tab5-linux
 export IDF_PATH=$PWD/vendor/esp-idf
 . "$IDF_PATH/export.sh"
 
-ES_BOARD=tab5 NOMMU_POOL_BESTFIT=1 NOMMU_USER_RESERVE=1 NOMMU_SYSTEM_MARK=1 \
-    bash linux/build-c68.sh --vendor /path/to/out --profile m3-lab
+ES_BOARD=tab5 bash linux/release-build.sh --vendor /path/to/out --profile m3-lab
 ```
 
-This compiles the boot shim, the Linux 7.2 SMP kernel with the Tab5 device tree and patches, and the Buildroot root filesystem with BusyBox, Dropbear, MicroPython and the ESP-Hosted-NG driver. The three `NOMMU_*` variables are the release settings of the user-pool allocator. Without `ES_BOARD=tab5` the build is for the Stamp-P4.
+`release-build.sh` is the same wrapper the release workflow calls; it sets the three `NOMMU_*` variables that are the release settings of the user-pool allocator, then runs `linux/build-c68.sh`. This compiles the boot shim, the Linux 7.2 SMP kernel with the Tab5 device tree and patches, and the Buildroot root filesystem with BusyBox, Dropbear, MicroPython and the ESP-Hosted-NG driver. Without `ES_BOARD=tab5` the build is for the Stamp-P4.
 
 `linux/tools/package-release.py --board tab5 --build-output /path/to/out --boot-image /path/to/out/buildroot/images/boot.img --output release --version v0.1.0` makes the release files.
 
