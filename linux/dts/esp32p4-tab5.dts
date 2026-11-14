@@ -101,6 +101,13 @@
 		stride = <1440>;
 		format = "r5g6b5";
 		espressif,flush-cache;
+		/*
+		 * RISC-V defaults OF devices to DMA-coherent, and the DMA core
+		 * skips dma_sync_* for coherent devices -- without this the
+		 * flush-cache writeback is a silent no-op and glyphs reach the
+		 * panel only as cache lines happen to be evicted.
+		 */
+		dma-noncoherent;
 		status = "reserved-fb";
 	};
 
