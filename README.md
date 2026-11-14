@@ -26,7 +26,7 @@ Checked on a Tab5 (ESP32-P4 rev v1.3, ST7121 panel), with the issue where the re
 | Hostname | A fresh boot drive names the board `tab5` (#12). |
 | Display | Text console on the panel through fbcon (`TER16x32`, 45x40 characters), confirmed by eye (#2). Kernel messages at boot are not shown (`loglevel=4`). A program can also draw through an `mmap` of `/dev/fb0`: four colour bands painted that way by `linux/tests/fb-mmap-test.c` showed on the panel and read back intact (#15). |
 | Touch | The panel's touch controller (I2C 0x55, up to 10 points) appears as `/dev/input/event0`; two fingers and the four corners were checked on the board (#2). |
-| Keyboard | The Tab5 Keyboard (A164, I2C 0x6d) types on the panel console. Letters, `Aa` tapped once and held, the `sym` layer and two keys held together were typed on the board and read back from `/dev/input`; the left LED was checked by eye (#14). The `Aa` lock and plugging the keyboard in while Linux runs are covered by the host test only. |
+| Keyboard | The Tab5 Keyboard (A164, I2C 0x6d) types on the panel console. Letters, `Aa` tapped once and held, the `sym` layer and two keys held together were typed on the board and read back from `/dev/input`; the left LED was checked by eye (#14). `Aa` tapped twice locks upper case and lights the left LED, one more tap unlocks it and the LED goes dark (checked on the LED registers and with a camera). Unplugged and plugged back in while Linux runs, the keyboard is detached and attached again within a second (#13). |
 | MicroPython | `python3` runs (v1.22.2). |
 | Memory | The NOMMU user pool grew by 8 KB over a 32 minute soak. A leak in `bootsyncd` that exhausted the pool within hours on this board is fixed (#3). |
 
