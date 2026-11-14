@@ -33,8 +33,8 @@ Signed-off-by: Devin <devin@cognition.ai>
 ---
  drivers/input/keyboard/Kconfig   |   8 +
  drivers/input/keyboard/Makefile  |   1 +
- drivers/input/keyboard/tab5-kbd.c | 365 ++++++++++++++++++++++++++++++
- 3 files changed, 362 insertions(+)
+ drivers/input/keyboard/tab5-kbd.c | 393 ++++++++++++++++++++++++++++++
+ 3 files changed, 402 insertions(+)
 
 diff --git a/drivers/input/keyboard/Kconfig b/drivers/input/keyboard/Kconfig
 --- a/drivers/input/keyboard/Kconfig
@@ -64,7 +64,7 @@ diff --git a/drivers/input/keyboard/tab5-kbd.c b/drivers/input/keyboard/tab5-kbd
 new file mode 100644
 --- /dev/null
 +++ b/drivers/input/keyboard/tab5-kbd.c
-@@ -0,0 +1,365 @@
+@@ -0,0 +1,393 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * M5Stack Tab5 Keyboard (A164) I2C driver.
@@ -82,6 +82,7 @@ new file mode 100644
 + *   0x00  INT_CFG    bit0/1/2 = key/hid/char event enables
 + *   0x01  INT_STA    pending event types; write 0 clears + releases INT
 + *   0x02  EVENT_NUM  queued event count; write 0 flushes the FIFO
++ *   0x03  BRIGHTNESS overall level of the two indicator LEDs
 + *   0x10  KB_MODE    0=key, 1=hid, 2=char
 + *   0x30  HID_EVENT  pops one entry per read: [modifier, usage];
 + *                    usage == 0 marks a release, 0xff/0xff means empty
@@ -116,6 +117,7 @@ new file mode 100644
 +#define TAB5KBD_REG_INT_CFG	0x00
 +#define TAB5KBD_REG_INT_STA	0x01
 +#define TAB5KBD_REG_EVENT_NUM	0x02
++#define TAB5KBD_REG_BRIGHTNESS	0x03
 +#define TAB5KBD_REG_KB_MODE	0x10
 +#define TAB5KBD_REG_HID_EVENT	0x30
 +#define TAB5KBD_REG_VERSION	0xfe
@@ -250,32 +252,12 @@ new file mode 100644
 +	       0 : -EIO;
 +}
 +
-+static void tab5kbd_event(struct tab5kbd *kbd, u8 modifier, u8 usage)
++/* Bring the reported modifier keys in line with the modifier byte. */
++static void tab5kbd_sync_modifiers(struct tab5kbd *kbd, u8 modifier)
 +{
 +	struct input_dev *input = kbd->input;
 +	unsigned int i;
-+	unsigned long bit;
 +
-+	if (usage) {
-+		u16 code = tab5kbd_code(usage);
-+
-+		if (code && !test_and_set_bit(usage, kbd->pressed)) {
-+			input_event(input, EV_MSC, MSC_SCAN, usage);
-+			input_report_key(input, code, 1);
-+		}
-+	} else {
-+		/*
-+		 * A zero usage is a bare release with no key identity:
-+		 * drop every tracked non-modifier usage, then let the
-+		 * modifier sync below re-assert what the byte still
-+		 * reports as held.
-+		 */
-+		for_each_set_bit(bit, kbd->pressed, TAB5KBD_MOD_FIRST) {
-+			input_event(input, EV_MSC, MSC_SCAN, bit);
-+			input_report_key(input, tab5kbd_keycode[bit], 0);
-+		}
-+		bitmap_clear(kbd->pressed, 0, TAB5KBD_MOD_FIRST);
-+	}
 +	for (i = 0; i < 8; i++) {
 +		unsigned int mod = TAB5KBD_MOD_FIRST + i;
 +
@@ -291,6 +273,41 @@ new file mode 100644
 +					 tab5kbd_modifier_keycode[i], 0);
 +		}
 +	}
++}
++
++static void tab5kbd_event(struct tab5kbd *kbd, u8 modifier, u8 usage)
++{
++	struct input_dev *input = kbd->input;
++	unsigned long bit;
++
++	if (usage) {
++		u16 code = tab5kbd_code(usage);
++
++		/*
++		 * Modifiers go first.  The MCU sends its symbol keys as a
++		 * shifted usage ('!' is LeftShift + '1'), so Shift must be
++		 * down before the key, and a Shift left over from the
++		 * previous symbol must be up before a plain key.
++		 */
++		tab5kbd_sync_modifiers(kbd, modifier);
++		if (code && !test_and_set_bit(usage, kbd->pressed)) {
++			input_event(input, EV_MSC, MSC_SCAN, usage);
++			input_report_key(input, code, 1);
++		}
++		return;
++	}
++
++	/*
++	 * A zero usage is a bare release with no key identity: drop
++	 * every tracked non-modifier usage first, then re-sync the
++	 * modifiers to what the byte still reports as held.
++	 */
++	for_each_set_bit(bit, kbd->pressed, TAB5KBD_MOD_FIRST) {
++		input_event(input, EV_MSC, MSC_SCAN, bit);
++		input_report_key(input, tab5kbd_keycode[bit], 0);
++	}
++	bitmap_clear(kbd->pressed, 0, TAB5KBD_MOD_FIRST);
++	tab5kbd_sync_modifiers(kbd, modifier);
 +}
 +
 +static void tab5kbd_drain(struct tab5kbd *kbd)
@@ -333,6 +350,7 @@ new file mode 100644
 +	struct tab5kbd *kbd;
 +	struct input_dev *input;
 +	u8 version = 0;
++	u32 brightness;
 +	int error, i;
 +
 +	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C))
@@ -396,6 +414,16 @@ new file mode 100644
 +	if (error)
 +		return dev_err_probe(&client->dev, error,
 +				     "keyboard configuration failed\n");
++
++	/*
++	 * Register 0x03 scales both indicator LEDs (Caps state and mode
++	 * colour); 0 turns them off.  Left at the chip default unless the
++	 * board asks for a level.
++	 */
++	if (!of_property_read_u32(client->dev.of_node,
++				  "m5stack,led-brightness", &brightness))
++		tab5kbd_write(client, TAB5KBD_REG_BRIGHTNESS,
++			      min_t(u32, brightness, 255));
 +
 +	dev_info(&client->dev,
 +		 "tab5-keyboard: fw 0x%02x, polling at %d Hz\n", version,

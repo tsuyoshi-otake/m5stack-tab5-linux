@@ -401,6 +401,8 @@
 		keyboard@6d {
 			compatible = "m5stack,tab5-keyboard";
 			reg = <0x6d>;
+			/* Both indicator LEDs off (Caps state and mode colour). */
+			m5stack,led-brightness = <0>;
 			status = "okay";
 		};
 	};
