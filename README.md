@@ -38,7 +38,7 @@ Not verified, or not there yet:
 - **Other panel lots.** Tab5 units ship with an ST7121 or an ST7123 display, and the oldest ones with an ILI9881C + GT911. The boot shim tells them apart by the touch controller at I2C 0x55; it carries the ST7123 init table from the stock BSP, but that path was never run. The ILI9881C/GT911 panel is not supported: the shim logs it, the display stays off and Linux boots headless on the serial console.
 - **Not ported:** audio (ES8388, ES7210, speaker), camera, IMU, power monitor, RTC, microSD, USB host and device (the USB-C port is the serial console), battery and charge control, and the buttons. The boot shim puts the I/O expanders into a safe state (speaker, camera and USB off, C6 supply on) and nothing in Linux touches them afterwards.
 - **Deep Sleep and the LP core** of the Stamp-P4 build are in the kernel and the shim, but have not been run on a Tab5.
-- **No USB drive.** The Stamp-P4 build keeps its configuration on a USB mass-storage drive; the Tab5 has no such port, so `credentials.txt`, `config.txt` and autorun are not reachable from a PC. The files still live in the boot FAT image in flash.
+- **No USB drive.** The Stamp-P4 build keeps its configuration on a USB mass-storage drive; the Tab5 has no such port, so `credentials.txt`, `config.txt` and autorun are not reachable from a PC. They are the same files with the same keys, in the boot FAT image in flash, and are changed on the board with `boot-edit` ([6. Change the configuration](#6-change-the-configuration)). `boot-edit` has only been run on a PC against a stand-in for the FAT mount, not yet on a Tab5.
 
 Things that are different from the Stamp-P4 image:
 
@@ -180,7 +180,21 @@ Root over SSH is key-only; on the Stamp that needs a file on the USB drive, whic
 
 For everything the userland shares with the Stamp-P4 build (the shell, `vi`, MicroPython, joining another Wi-Fi network, the `/boot` configuration files, Deep Sleep), see the [Stamp-P4 README](https://github.com/tsuyoshi-otake/m5stamp-p4-c6-linux#readme). Its USB-drive instructions do not apply here, and none of it has been re-tested on the Tab5 except where [Status](#status-v010) says so. Serial access, troubleshooting and recovery tips are in [docs/troubleshooting.md](docs/troubleshooting.md).
 
-### 6. Keyboard (optional)
+### 6. Change the configuration
+
+The Stamp-P4 README tells you to open the USB drive and edit `config.txt`, `credentials.txt`, `wpa_supplicant.conf`, `authorized_keys` or the autorun program there. The Tab5 has no USB drive, so do the same on the board, as root, with `boot-edit`:
+
+```sh
+boot-edit --ls                      # what is on the drive
+boot-edit config.txt                # edit with vi; saved when you leave vi
+boot-edit --cat credentials.txt     # print a file
+boot-edit --put authorized_keys < /tmp/id_ed25519.pub
+boot-edit --rm main.py
+```
+
+Everything else is as on the Stamp-P4: a change is checked, written to flash and applied about three seconds later, and the console shows the same `[bootsync] Saved to flash` line. `boot-edit` waits for that line's result and says `saved to flash`, or tells you that the save was not confirmed.
+
+### 7. Keyboard (optional)
 
 The M5Stack Tab5 Keyboard (A164) types on the panel console. Plug it in before or after power-on; the kernel logs `tab5-keyboard: attached` within a second, and unplugging it releases every key it was holding.
 
