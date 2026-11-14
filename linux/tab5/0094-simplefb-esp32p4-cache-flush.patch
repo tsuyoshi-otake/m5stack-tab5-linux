@@ -20,6 +20,11 @@ the call; apps that never announce anything get a second delayed work
 that marks the full scan every `espressif,flush-interval-ms` while a
 mapping is alive (cleared on the last close, no property = no ticker).
 
+The writeback itself runs in 32 KB slices.  Each dma_sync call holds
+the cross-hart cache lock with interrupts off for its whole range, so
+one call for a 1.8 MB frame would stall interrupts on this hart and an
+execve's icache flush on the other for the full duration.
+
 Only staged for ES_BOARD=tab5 builds (linux/build-m1.sh).
 
 --- a/drivers/video/fbdev/simplefb.c
@@ -70,7 +75,7 @@ Only staged for ES_BOARD=tab5 builds (linux/build-m1.sh).
  	simplefb_regulators_destroy(info->par);
  	simplefb_clocks_destroy(info->par);
  	simplefb_detach_genpds(info->par);
-@@ -116,6 +134,212 @@
+@@ -116,6 +134,229 @@
  		release_mem_region(mem->start, resource_size(mem));
  }
  
@@ -85,11 +90,23 @@ Only staged for ES_BOARD=tab5 builds (linux/build-m1.sh).
 + */
 +#define SIMPLEFB_FLUSH_MS 8
 +
++/*
++ * One sync call runs the ROM cache engine over its whole range with
++ * interrupts off and the cross-hart cache lock held; the other hart
++ * spins on that lock, interrupts off as well, whenever an execve
++ * flushes the icache.  A full frame is 1.8 MB, so it is written back
++ * in slices and both harts take their interrupts in between.  Slices
++ * are cut on SIMPLEFB_FLUSH_ALIGN so each call covers whole cache
++ * lines at either level (64-byte L1, 64- or 128-byte L2).
++ */
++#define SIMPLEFB_FLUSH_SLICE	0x8000
++#define SIMPLEFB_FLUSH_ALIGN	128
++
 +static void simplefb_flush_do(struct fb_info *info)
 +{
 +	struct simplefb_par *par = info->par;
 +	unsigned long flags;
-+	u32 y0, y1, off, len;
++	u32 y0, y1, off, end, len;
 +
 +	spin_lock_irqsave(&par->flush_lock, flags);
 +	y0 = par->flush_y0;
@@ -100,13 +117,17 @@ Only staged for ES_BOARD=tab5 builds (linux/build-m1.sh).
 +
 +	if (y0 > y1)
 +		return;
-+	off = y0 * info->fix.line_length;
-+	len = (y1 - y0 + 1) * info->fix.line_length;
-+	if (off + len > info->fix.smem_len)
-+		len = info->fix.smem_len - off;
-+	dma_sync_single_for_device(info->device,
-+				   info->fix.smem_start + off, len,
-+				   DMA_TO_DEVICE);
++	off = round_down(y0 * info->fix.line_length, SIMPLEFB_FLUSH_ALIGN);
++	end = round_up((y1 + 1) * info->fix.line_length, SIMPLEFB_FLUSH_ALIGN);
++	if (end > info->fix.smem_len)
++		end = info->fix.smem_len;
++	while (off < end) {
++		len = min_t(u32, end - off, SIMPLEFB_FLUSH_SLICE);
++		dma_sync_single_for_device(info->device,
++					   info->fix.smem_start + off, len,
++					   DMA_TO_DEVICE);
++		off += len;
++	}
 +}
 +
 +static void simplefb_flush_work(struct work_struct *work)
@@ -274,8 +295,9 @@ Only staged for ES_BOARD=tab5 builds (linux/build-m1.sh).
 +static int simplefb_ioctl_flush(struct fb_info *info, unsigned int cmd,
 +				unsigned long arg)
 +{
++	/* -ENOTTY, as fbmem answers when a driver has no fb_ioctl at all. */
 +	if (cmd != FBIO_WAITFORVSYNC)
-+		return -EINVAL;
++		return -ENOTTY;
 +	simplefb_flush_now(info);
 +	return 0;
 +}
@@ -283,7 +305,7 @@ Only staged for ES_BOARD=tab5 builds (linux/build-m1.sh).
  static const struct fb_ops simplefb_ops = {
  	.owner		= THIS_MODULE,
  	FB_DEFAULT_IOMEM_OPS,
-@@ -123,6 +347,22 @@
+@@ -123,6 +364,22 @@
  	.fb_setcolreg	= simplefb_setcolreg,
  };
  
@@ -306,7 +328,7 @@ Only staged for ES_BOARD=tab5 builds (linux/build-m1.sh).
  static struct simplefb_format simplefb_formats[] = SIMPLEFB_FORMATS;
  
  struct simplefb_params {
-@@ -599,6 +839,18 @@
+@@ -599,6 +856,18 @@
  	par->size = info->fix.smem_len;
  
  	info->fbops = &simplefb_ops;
