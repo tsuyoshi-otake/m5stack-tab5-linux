@@ -608,4 +608,4 @@ new file mode 100644
 +
 +MODULE_AUTHOR("Devin <devin@cognition.ai>");
 +MODULE_DESCRIPTION("M5Stack Tab5 Keyboard (A164) I2C driver");
-+MODULE_LICENSE("GPL");
++MODULE_LICENSE("GPL");
