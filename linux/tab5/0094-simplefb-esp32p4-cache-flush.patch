@@ -25,19 +25,47 @@ the cross-hart cache lock with interrupts off for its whole range, so
 one call for a 1.8 MB frame would stall interrupts on this hart and an
 execve's icache flush on the other for the full duration.
 
+On a kernel without an MMU the fb character device can only be mapped
+when FB_PROVIDE_GET_FB_UNMAPPED_AREA is set, and that symbol has no
+prompt: without a select, mmap of /dev/fb0 fails with ENODEV and none
+of the mmap handling above is reachable.  FB_SIMPLE selects it for
+!MMU.
+
+The mapping is then the framebuffer itself, at the address the generic
+helper hands out.  fb_io_mmap() cannot make it: it ends in
+remap_pfn_range(), which without an MMU accepts only a mapping that
+starts on a page boundary, and the boot shim's framebuffer comes from
+the IDF panel driver's heap allocation, aligned to a cache line
+(0x49000ec0 on the board this was tested on).  mmap returned EINVAL.
+The driver marks the mapping itself in that configuration; the pointer
+mmap returns is the first pixel.
+
 Only staged for ES_BOARD=tab5 builds (linux/build-m1.sh).
 
+--- a/drivers/video/fbdev/Kconfig
++++ b/drivers/video/fbdev/Kconfig
+@@ -1765,6 +1765,7 @@
+ 	depends on FB
+ 	depends on !DRM_SIMPLEDRM
+ 	select APERTURE_HELPERS
++	select FB_PROVIDE_GET_FB_UNMAPPED_AREA if !MMU
+ 	select FB_IOMEM_HELPERS
+ 	help
+ 	  Say Y if you want support for a simple frame-buffer.
 --- a/drivers/video/fbdev/simplefb.c
 +++ b/drivers/video/fbdev/simplefb.c
-@@ -15,6 +15,7 @@
+@@ -15,8 +15,10 @@
  #include <linux/aperture.h>
  #include <linux/clk.h>
  #include <linux/errno.h>
 +#include <linux/dma-mapping.h>
  #include <linux/fb.h>
  #include <linux/io.h>
++#include <linux/mm.h>
  #include <linux/module.h>
-@@ -27,6 +28,8 @@
+ #include <linux/of.h>
+ #include <linux/of_clk.h>
+@@ -27,6 +29,8 @@
  #include <linux/platform_device.h>
  #include <linux/pm_domain.h>
  #include <linux/regulator/consumer.h>
@@ -46,7 +74,7 @@ Only staged for ES_BOARD=tab5 builds (linux/build-m1.sh).
  
  static const struct fb_fix_screeninfo simplefb_fix = {
  	.id		= "simple",
-@@ -89,6 +92,17 @@
+@@ -89,6 +93,17 @@
  	u32 regulator_count;
  	struct regulator **regulators;
  #endif
@@ -64,7 +92,7 @@ Only staged for ES_BOARD=tab5 builds (linux/build-m1.sh).
  };
  
  static void simplefb_clocks_destroy(struct simplefb_par *par);
-@@ -104,6 +118,10 @@
+@@ -104,6 +119,10 @@
  	struct simplefb_par *par = info->par;
  	struct resource *mem = par->mem;
  
@@ -75,7 +103,7 @@ Only staged for ES_BOARD=tab5 builds (linux/build-m1.sh).
  	simplefb_regulators_destroy(info->par);
  	simplefb_clocks_destroy(info->par);
  	simplefb_detach_genpds(info->par);
-@@ -116,6 +134,229 @@
+@@ -116,6 +135,252 @@
  		release_mem_region(mem->start, resource_size(mem));
  }
  
@@ -233,13 +261,36 @@ Only staged for ES_BOARD=tab5 builds (linux/build-m1.sh).
 +				      msecs_to_jiffies(par->flush_interval_ms));
 +}
 +
++/*
++ * Without an MMU the mapping is the framebuffer itself, at the address
++ * get_fb_unmapped_area() handed out.  fb_io_mmap() ends in
++ * remap_pfn_range(), which there accepts only a mapping that starts on
++ * a page boundary; the boot shim's framebuffer is cache-line aligned.
++ */
++static int simplefb_mmap_direct(struct fb_info *info,
++				struct vm_area_struct *vma)
++{
++	unsigned long len = vma->vm_end - vma->vm_start;
++
++	if (vma->vm_pgoff ||
++	    vma->vm_start != (unsigned long)info->screen_base ||
++	    len > PAGE_ALIGN(info->fix.smem_len))
++		return -EINVAL;
++
++	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
++	return 0;
++}
++
 +static int simplefb_mmap_flush(struct fb_info *info, struct vm_area_struct *vma)
 +{
 +	struct simplefb_par *par = info->par;
 +	unsigned long flags;
 +	int ret;
 +
-+	ret = fb_io_mmap(info, vma);
++	if (IS_ENABLED(CONFIG_MMU))
++		ret = fb_io_mmap(info, vma);
++	else
++		ret = simplefb_mmap_direct(info, vma);
 +	if (ret)
 +		return ret;
 +
@@ -305,7 +356,7 @@ Only staged for ES_BOARD=tab5 builds (linux/build-m1.sh).
  static const struct fb_ops simplefb_ops = {
  	.owner		= THIS_MODULE,
  	FB_DEFAULT_IOMEM_OPS,
-@@ -123,6 +364,22 @@
+@@ -123,6 +388,22 @@
  	.fb_setcolreg	= simplefb_setcolreg,
  };
  
@@ -328,7 +379,7 @@ Only staged for ES_BOARD=tab5 builds (linux/build-m1.sh).
  static struct simplefb_format simplefb_formats[] = SIMPLEFB_FORMATS;
  
  struct simplefb_params {
-@@ -599,6 +856,18 @@
+@@ -599,6 +880,18 @@
  	par->size = info->fix.smem_len;
  
  	info->fbops = &simplefb_ops;
