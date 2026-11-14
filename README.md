@@ -34,7 +34,6 @@ Not verified, or not there yet:
 - **Other panel lots.** Tab5 units ship with an ST7121 or an ST7123 display, and the oldest ones with an ILI9881C + GT911. The boot shim tells them apart by the touch controller at I2C 0x55; it carries the ST7123 init table from the stock BSP, but that path was never run. The ILI9881C/GT911 panel is not supported: the shim logs it, the display stays off and Linux boots headless on the serial console.
 - **Not ported:** audio (ES8388, ES7210, speaker), camera, IMU, power monitor, RTC, microSD, USB host and device (the USB-C port is the serial console), battery and charge control, and the buttons. The boot shim puts the I/O expanders into a safe state (speaker, camera and USB off, C6 supply on) and nothing in Linux touches them afterwards.
 - **Deep Sleep and the LP core** of the Stamp-P4 build are in the kernel and the shim, but have not been run on a Tab5.
-- **Cosmetic:** the default host name is still `stamp-p4` (shell prompt, `stamp-p4.local` over mDNS).
 - **No USB drive.** The Stamp-P4 build keeps its configuration on a USB mass-storage drive; the Tab5 has no such port, so `credentials.txt`, `config.txt` and autorun are not reachable from a PC. The files still live in the boot FAT image in flash.
 
 Things that are different from the Stamp-P4 image:
@@ -154,6 +153,8 @@ cat /tmp/credentials.txt
 ```
 
 `ssid=` (`m5-XXXX`) and `psk=` are the SoftAP, `password=` is the SSH and console password of user `m5`, and `root_password=` is what `su` asks for. **The serial log then contains the passwords; redact that line before you share logs.** There is no shared default: every board gets its own.
+
+On that first boot only, the panel shows the SoftAP credentials as a QR code for fifteen minutes — point a phone camera at it to join `m5-XXXX`. To show it again later, run as root: `wifi-qr --panel --for 60` (or `wifi-qr > /dev/tty0` for a text QR); `wifi-qr --clear` erases it.
 
 ### 5. Connect over Wi-Fi
 

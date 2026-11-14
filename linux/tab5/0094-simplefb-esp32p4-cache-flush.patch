@@ -5,64 +5,172 @@ The Tab5 boot shim hands a live DPI/DW-GDMA scan-out stream to Linux
 through a simple-framebuffer node.  The GDMA reader does not snoop the
 CPU data cache, so cfb console output needs an explicit writeback or
 the panel shows stale/torn pixels.  The node carries
-`espressif,flush-cache`; when present, wrap the draw ops with
-dma_sync_single_for_device -- the same non-coherent primitive the
-dw-mmc IDMAC patches use.
+`espressif,flush-cache`; when present, draw and write ops record the
+scanline band they touched and a delayed work writes the union band
+back once, so a burst of ops publishes in a single writeback instead
+of showing half-drawn cells on the panel.  Oops/panic paths flush
+inline because the workqueue may never run again.
+
+fb_write is covered too: wifi-qr pwrites /dev/fb0 directly and relies
+on its pixels reaching the panel without a later cfb op.
 
 Only staged for ES_BOARD=tab5 builds (linux/build-m1.sh).
 
 --- a/drivers/video/fbdev/simplefb.c
 +++ b/drivers/video/fbdev/simplefb.c
-@@ -16,4 +16,5 @@
+@@ -15,6 +15,7 @@
+ #include <linux/aperture.h>
  #include <linux/clk.h>
  #include <linux/errno.h>
 +#include <linux/dma-mapping.h>
  #include <linux/fb.h>
  #include <linux/io.h>
-@@ -110,6 +111,36 @@ static void simplefb_destroy(struct fb_info
- 	if (mem)
+ #include <linux/module.h>
+@@ -27,6 +28,8 @@
+ #include <linux/platform_device.h>
+ #include <linux/pm_domain.h>
+ #include <linux/regulator/consumer.h>
++#include <linux/spinlock.h>
++#include <linux/workqueue.h>
+ 
+ static const struct fb_fix_screeninfo simplefb_fix = {
+ 	.id		= "simple",
+@@ -89,6 +92,12 @@
+ 	u32 regulator_count;
+ 	struct regulator **regulators;
+ #endif
++	/* espressif,flush-cache deferred writeback state */
++	struct delayed_work flush_work;
++	spinlock_t flush_lock;
++	struct fb_info *info;
++	u32 flush_y0;
++	u32 flush_y1;
+ };
+ 
+ static void simplefb_clocks_destroy(struct simplefb_par *par);
+@@ -104,6 +113,8 @@
+ 	struct simplefb_par *par = info->par;
+ 	struct resource *mem = par->mem;
+ 
++	if (par->info)
++		cancel_delayed_work_sync(&par->flush_work);
+ 	simplefb_regulators_destroy(info->par);
+ 	simplefb_clocks_destroy(info->par);
+ 	simplefb_detach_genpds(info->par);
+@@ -116,6 +127,105 @@
  		release_mem_region(mem->start, resource_size(mem));
  }
-+
+ 
 +/*
 + * espressif,flush-cache: the framebuffer memory is read by a DMA
 + * master (Tab5's DPI/DW-GDMA stream handed over from the boot shim)
-+ * that does not snoop the CPU data cache.  Write back after every cfb
-+ * operation so console output reaches the panel.
++ * that does not snoop the CPU data cache.  Writes stay in the cache
++ * until a writeback publishes them, so each op only records the
++ * scanline band it touched; SIMPLEFB_FLUSH_MS later a work item
++ * writes the union band back.  One burst of ops therefore lands on
++ * the panel as a single update instead of leaking half-drawn cells.
 + */
-+static void simplefb_flush_cache(struct fb_info *info)
++#define SIMPLEFB_FLUSH_MS 8
++
++static void simplefb_flush_do(struct fb_info *info)
 +{
-+	dma_sync_single_for_device(info->device, info->fix.smem_start,
-+				   info->fix.smem_len, DMA_TO_DEVICE);
++	struct simplefb_par *par = info->par;
++	unsigned long flags;
++	u32 y0, y1, off, len;
++
++	spin_lock_irqsave(&par->flush_lock, flags);
++	y0 = par->flush_y0;
++	y1 = par->flush_y1;
++	par->flush_y0 = ~0u;
++	par->flush_y1 = 0;
++	spin_unlock_irqrestore(&par->flush_lock, flags);
++
++	if (y0 > y1)
++		return;
++	off = y0 * info->fix.line_length;
++	len = (y1 - y0 + 1) * info->fix.line_length;
++	if (off + len > info->fix.smem_len)
++		len = info->fix.smem_len - off;
++	dma_sync_single_for_device(info->device,
++				   info->fix.smem_start + off, len,
++				   DMA_TO_DEVICE);
++}
++
++static void simplefb_flush_work(struct work_struct *work)
++{
++	struct simplefb_par *par = container_of(to_delayed_work(work),
++						struct simplefb_par, flush_work);
++
++	simplefb_flush_do(par->info);
++}
++
++static void simplefb_flush_mark(struct fb_info *info, u32 dy, u32 height)
++{
++	struct simplefb_par *par = info->par;
++	unsigned long flags;
++
++	if (!height)
++		return;
++	spin_lock_irqsave(&par->flush_lock, flags);
++	if (dy < par->flush_y0)
++		par->flush_y0 = dy;
++	if (dy + height - 1 > par->flush_y1)
++		par->flush_y1 = dy + height - 1;
++	spin_unlock_irqrestore(&par->flush_lock, flags);
++
++	/* Oops/panic console writes must not wait for the workqueue. */
++	if (oops_in_progress) {
++		cancel_delayed_work(&par->flush_work);
++		simplefb_flush_do(info);
++		return;
++	}
++	schedule_delayed_work(&par->flush_work,
++			      msecs_to_jiffies(SIMPLEFB_FLUSH_MS));
 +}
 +
 +static void simplefb_fillrect_flush(struct fb_info *info, const struct fb_fillrect *rect)
 +{
 +	cfb_fillrect(info, rect);
-+	simplefb_flush_cache(info);
++	simplefb_flush_mark(info, rect->dy, rect->height);
 +}
 +
 +static void simplefb_copyarea_flush(struct fb_info *info, const struct fb_copyarea *area)
 +{
 +	cfb_copyarea(info, area);
-+	simplefb_flush_cache(info);
++	simplefb_flush_mark(info, area->dy, area->height);
 +}
 +
 +static void simplefb_imageblit_flush(struct fb_info *info, const struct fb_image *image)
 +{
 +	cfb_imageblit(info, image);
-+	simplefb_flush_cache(info);
++	simplefb_flush_mark(info, image->dy, image->height);
 +}
- 
++
++static ssize_t simplefb_write_flush(struct fb_info *info, const char __user *buf,
++				  size_t count, loff_t *ppos)
++{
++	ssize_t done = fb_io_write(info, buf, count, ppos);
++
++	if (done > 0) {
++		u32 first = (u32)(*ppos - done) / info->fix.line_length;
++		u32 last = (u32)(*ppos - 1) / info->fix.line_length;
++
++		simplefb_flush_mark(info, first, last - first + 1);
++	}
++	return done;
++}
++
  static const struct fb_ops simplefb_ops = {
  	.owner		= THIS_MODULE,
-@@ -119,6 +148,17 @@ static const struct fb_ops simplefb_ops =
+ 	FB_DEFAULT_IOMEM_OPS,
+@@ -123,6 +233,18 @@
  	.fb_setcolreg	= simplefb_setcolreg,
  };
  
 +static const struct fb_ops simplefb_flush_ops = {
 +	.owner		= THIS_MODULE,
-+	__FB_DEFAULT_IOMEM_OPS_RDWR,
++	.fb_read	= fb_io_read,
++	.fb_write	= simplefb_write_flush,
 +	__FB_DEFAULT_IOMEM_OPS_MMAP,
 +	.fb_destroy	= simplefb_destroy,
 +	.fb_setcolreg	= simplefb_setcolreg,
@@ -74,12 +182,18 @@ Only staged for ES_BOARD=tab5 builds (linux/build-m1.sh).
  static struct simplefb_format simplefb_formats[] = SIMPLEFB_FORMATS;
  
  struct simplefb_params {
-@@ -600,6 +639,8 @@ static int simplefb_probe(struct platform_
+@@ -599,6 +721,14 @@
  	par->size = info->fix.smem_len;
  
  	info->fbops = &simplefb_ops;
-+	if (of_property_read_bool(pdev->dev.of_node, "espressif,flush-cache"))
++	if (of_property_read_bool(pdev->dev.of_node, "espressif,flush-cache")) {
++		spin_lock_init(&par->flush_lock);
++		INIT_DELAYED_WORK(&par->flush_work, simplefb_flush_work);
++		par->flush_y0 = ~0u;
++		par->flush_y1 = 0;
++		par->info = info;
 +		info->fbops = &simplefb_flush_ops;
++	}
  	info->screen_base = ioremap_wc(info->fix.smem_start,
  				       info->fix.smem_len);
  	if (!info->screen_base) {

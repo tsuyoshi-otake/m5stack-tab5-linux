@@ -74,8 +74,12 @@
 		 * would look dead.  fbcon=font:TER16x32: the 8x16 default makes
 		 * 90 x 80 cells on 720x1280, too small to read; the 16x32 font
 		 * (45 x 40) must be named because fbcon prefers 8x16 by default.
+		 * fbcon=rotate:3 draws the console 90 deg CCW -- the keyboard
+		 * dock holds the panel in landscape, so an 80 x 22 cell
+		 * console reads upright (the ST712x MADCTL only mirrors; the
+		 * 90 deg turn has to be done in fbcon, the panel cannot).
 		 */
-		bootargs = "earlycon=esp32p4usbjtag,mmio32,0x500d2000 console=tty0 console=ttyGS1,115200n8 loglevel=4 consoleblank=0 fbcon=font:TER16x32 root=/dev/mtdblock0 rootfstype=squashfs ro init=/sbin/init maxcpus=1";
+		bootargs = "earlycon=esp32p4usbjtag,mmio32,0x500d2000 console=tty0 console=ttyGS1,115200n8 loglevel=4 consoleblank=0 fbcon=font:TER16x32 fbcon=rotate:3 root=/dev/mtdblock0 rootfstype=squashfs ro init=/sbin/init maxcpus=1";
 	};
 
 	/*
@@ -97,6 +101,13 @@
 		stride = <1440>;
 		format = "r5g6b5";
 		espressif,flush-cache;
+		/*
+		 * RISC-V defaults OF devices to DMA-coherent, and the DMA core
+		 * skips dma_sync_* for coherent devices -- without this the
+		 * flush-cache writeback is a silent no-op and glyphs reach the
+		 * panel only as cache lines happen to be evicted.
+		 */
+		dma-noncoherent;
 		status = "reserved-fb";
 	};
 
@@ -362,6 +373,36 @@
 				<&gpio0 23 IRQ_TYPE_EDGE_FALLING>;
 			touchscreen-size-x = <720>;
 			touchscreen-size-y = <1280>;
+			/* Match fbcon=rotate:3 (CCW): x = ymax - y, y = x. */
+			touchscreen-swapped-x-y;
+			touchscreen-inverted-x;
+			status = "okay";
+		};
+	};
+
+	/*
+	 * Ext.Port1 keyboard bus: the A164 unit is an STM32F030C8T6
+	 * matrix scanner at 0x6d on a dedicated hw GPIO0 (SDA) /
+	 * GPIO1 (SCL) pair -- a bus of its own, independent of the
+	 * internal bus above, so a wedge there cannot strand it.
+	 * Its INT is hw GPIO50 on bank 1, which the esp32p4 gpio
+	 * driver does not wire to an irq_chip, so the driver polls
+	 * the chip FIFO instead of describing the line here.
+	 */
+	i2c1: i2c-gpio-1 {
+		compatible = "i2c-gpio";
+		#address-cells = <1>;
+		#size-cells = <0>;
+		gpios = <&gpio0 0 GPIO_ACTIVE_HIGH>,	/* SDA */
+			<&gpio0 1 GPIO_ACTIVE_HIGH>;	/* SCL */
+		i2c-gpio,delay-us = <5>;
+		status = "okay";
+
+		keyboard@6d {
+			compatible = "m5stack,tab5-keyboard";
+			reg = <0x6d>;
+			/* Both indicator LEDs off (Caps state and mode colour). */
+			m5stack,led-brightness = <0>;
 			status = "okay";
 		};
 	};

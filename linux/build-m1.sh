@@ -581,6 +581,12 @@ if mode == "ap":
     conf = (
         "update_config=0\n"
         "ap_scan=1\n\n"
+        "# Issue #4 experiment for Android joins (not for v0.1.0): uncomment\n"
+        "# to retry a phone against a plainer AP.  country= adds a Country IE\n"
+        "# to beacons and pushes the regdom to the C6.  The pairwise=/group=\n"
+        "# lines at the end of network={} come after CCMP and win, forcing\n"
+        "# WPA2-TKIP, which also drops 802.11n and bisects the C6 CCMP/HT path.\n"
+        "#country=JP\n\n"
         "network={\n"
         f"\tssid={json.dumps(ssid, ensure_ascii=False)}\n"
         "\tmode=2\n"
@@ -590,6 +596,9 @@ if mode == "ap":
         "\tpairwise=CCMP\n"
         "\tgroup=CCMP\n"
         f"\tpsk={json.dumps(psk, ensure_ascii=False)}\n"
+        "\t# issue #4 experiment: see the comment above network={}.\n"
+        "\t#pairwise=TKIP\n"
+        "\t#group=TKIP\n"
         "}\n"
     )
 else:
@@ -1235,6 +1244,12 @@ CONFIG_INPUT=y
 CONFIG_INPUT_EVDEV=y
 CONFIG_INPUT_TOUCHSCREEN=y
 CONFIG_TOUCHSCREEN_ST7123=y
+# Ext.Port1 A164 keyboard: STM32 at 0x6d on the dedicated hw GPIO0/1
+# pair (linux/tab5/0098); polled -- its bank-1 INT has no irq_chip.
+# INPUT_KEYBOARD is spelled out because CONFIG_EXPERT drops its
+# default y.
+CONFIG_INPUT_KEYBOARD=y
+CONFIG_KEYBOARD_TAB5=y
 EOF
 fi
 if [[ -n "$pstore_identity" ]]; then
@@ -2361,8 +2376,16 @@ if $lab_profile; then
 	# PR_SET_SYSTEM_WORK wrapper so system scripts keep system-side
 	# NOMMU classification when a user starts them (#50 round 4).
 	set_config_value "${br_output}/.config" BR2_PACKAGE_RUN_SYSTEM y
+	# First-boot SoftAP credentials QR on the Tab5 panel (#4).  The
+	# package only exists on Tab5 builds.
+	if [[ "$board" == tab5 ]]; then
+		set_config_value "${br_output}/.config" BR2_PACKAGE_WIFI_QR y
+	else
+		set_config_value "${br_output}/.config" BR2_PACKAGE_WIFI_QR "# BR2_PACKAGE_WIFI_QR is not set"
+	fi
 else
 	set_config_value "${br_output}/.config" BR2_PACKAGE_BOOT_COMMIT "# BR2_PACKAGE_BOOT_COMMIT is not set"
+	set_config_value "${br_output}/.config" BR2_PACKAGE_WIFI_QR "# BR2_PACKAGE_WIFI_QR is not set"
 fi
 set_config_value "${br_output}/.config" BR2_ROOTFS_OVERLAY "\"${rootfs_overlay}\""
 set_config_value "${br_output}/.config" BR2_ROOTFS_POST_BUILD_SCRIPT "\"${post_build_scripts}\""
@@ -2611,6 +2634,16 @@ if $ssh_profile; then
 				exit 1
 			}
 		done
+		if [[ "$board" == tab5 ]]; then
+			grep -Fqx -- "BR2_PACKAGE_WIFI_QR=y" "${br_output}/.config" || {
+				echo "m3-lab config check failed: BR2_PACKAGE_WIFI_QR=y" >&2
+				exit 1
+			}
+			[[ -x "${br_output}/target/usr/bin/wifi-qr" ]] || {
+				echo "m3-lab check failed: wifi-qr missing" >&2
+				exit 1
+			}
+		fi
 		for opt in INETD SYSLOGD UDHCPD; do
 			grep -Fqx -- "# CONFIG_${opt} is not set" \
 				"${br_output}"/build/busybox-[0-9]*/.config || {
