@@ -22,7 +22,7 @@
 / {
 	#address-cells = <1>;
 	#size-cells = <1>;
-	model = "M5Stack Tab5 (WIP)";
+	model = "M5Stack Tab5";
 	compatible = "m5stack,tab5", "espressif,esp32p4";
 
 	cpus {
@@ -101,6 +101,13 @@
 		stride = <1440>;
 		format = "r5g6b5";
 		espressif,flush-cache;
+		/*
+		 * Period for the mmap writeback ticker: while a mapping of
+		 * /dev/fb0 is alive the whole scan is republished this often,
+		 * so apps that never signal a finished frame still reach the
+		 * panel.  0 (or absent) disables the ticker.
+		 */
+		espressif,flush-interval-ms = <50>;
 		/*
 		 * RISC-V defaults OF devices to DMA-coherent, and the DMA core
 		 * skips dma_sync_* for coherent devices -- without this the
@@ -401,8 +408,12 @@
 		keyboard@6d {
 			compatible = "m5stack,tab5-keyboard";
 			reg = <0x6d>;
-			/* Both indicator LEDs off (Caps state and mode colour). */
-			m5stack,led-brightness = <0>;
+			/*
+			 * How bright the Aa (upper case) LED is when lit,
+			 * 0..100; 20 is the keyboard's own default.  The
+			 * mode LED next to it is always dark.
+			 */
+			m5stack,led-brightness = <20>;
 			status = "okay";
 		};
 	};

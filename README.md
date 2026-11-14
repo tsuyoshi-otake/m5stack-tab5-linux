@@ -20,21 +20,25 @@ Checked on a Tab5 (ESP32-P4 rev v1.3, ST7121 panel), with the issue where the re
 | :--- | :--- |
 | Boot | Linux 7.2.11 SMP boots to the shell on both cores (`/sys/devices/system/cpu/online` = `0-1`) on the USB-C serial console (#1, #2). |
 | Wi-Fi hardware | The C6 runs ESP-Hosted-NG 1.0.6 (`NG-1.0.6.0.1`); the kernel logs `mmc0: new SDIO card` and `wlan0` appears (#1). |
-| SoftAP + DHCP | `iw dev wlan0 info` reports `type AP`. A Linux station (a Stamp-P4) joined with WPA2, got a lease with gateway and DNS, and pinged the board and back (#4). |
-| Display | Text console on the panel through fbcon (`TER16x32`, 45x40 characters), confirmed by eye (#2). Kernel messages at boot are not shown (`loglevel=4`). |
+| SoftAP + DHCP | `iw dev wlan0 info` reports `type AP`. A Linux station (a Stamp-P4) joined with WPA2, got a lease with gateway and DNS, and pinged the board and back (#4). An Android 15 phone joined with the SoftAP's name and key and had an address, gateway and DNS within about 4 s (#4, #9). |
+| Wi-Fi QR code | On the first boot the panel shows a QR code for the SoftAP for fifteen minutes. A camera read it back as the board's SSID and key; it clears itself, and it does not come back on the next boot (#9). |
+| SSH over Wi-Fi | `m5` logged in with its password through the SoftAP, relayed by the phone above (#4). |
+| Hostname | A fresh boot drive names the board `tab5` (#12). |
+| Display | Text console on the panel through fbcon (`TER16x32`, 45x40 characters), confirmed by eye (#2). Kernel messages at boot are not shown (`loglevel=4`). A program can also draw through an `mmap` of `/dev/fb0`: four colour bands painted that way by `linux/tests/fb-mmap-test.c` showed on the panel and read back intact (#15). |
 | Touch | The panel's touch controller (I2C 0x55, up to 10 points) appears as `/dev/input/event0`; two fingers and the four corners were checked on the board (#2). |
+| Keyboard | The Tab5 Keyboard (A164, I2C 0x6d) types on the panel console. Letters, `Aa` tapped once and held, the `sym` layer and two keys held together were typed on the board and read back from `/dev/input`; the left LED was checked by eye (#14). `Aa` tapped twice locks upper case and lights the left LED, one more tap unlocks it and the LED goes dark (checked on the LED registers and with a camera). Unplugged and plugged back in while Linux runs, the keyboard is detached and attached again within a second (#13). |
 | MicroPython | `python3` runs (v1.22.2). |
 | Memory | The NOMMU user pool grew by 8 KB over a 32 minute soak. A leak in `bootsyncd` that exhausted the pool within hours on this board is fixed (#3). |
 
 Not verified, or not there yet:
 
-- **Joining the SoftAP from a phone.** An Android phone sat on "connecting" before the DHCP server handed out a gateway and DNS (#4). Whether it joins now has not been confirmed.
-- **Logging in over SSH through Wi-Fi.** Dropbear answers with its banner on the loopback interface; a login over the air has not been tested.
+- **Reaching the board from a phone that also has mobile data.** The SoftAP has no internet, so Android keeps mobile data as its default network: on the phone above, a plain `ping` or connection to 192.168.4.1 went out over LTE and failed, while `ping -I wlan0` reached the board. An SSH app on such a phone will likely fail the same way; turn mobile data off while you use the board. The phone joined from its shell (`cmd wifi connect-network`), not by scanning the QR code with its own camera.
+- **iPhone, and joining from the QR code with a phone camera**, have not been tried.
 - **Station mode** (joining your own Wi-Fi) has not been tried on the Tab5.
 - **Other panel lots.** Tab5 units ship with an ST7121 or an ST7123 display, and the oldest ones with an ILI9881C + GT911. The boot shim tells them apart by the touch controller at I2C 0x55; it carries the ST7123 init table from the stock BSP, but that path was never run. The ILI9881C/GT911 panel is not supported: the shim logs it, the display stays off and Linux boots headless on the serial console.
 - **Not ported:** audio (ES8388, ES7210, speaker), camera, IMU, power monitor, RTC, microSD, USB host and device (the USB-C port is the serial console), battery and charge control, and the buttons. The boot shim puts the I/O expanders into a safe state (speaker, camera and USB off, C6 supply on) and nothing in Linux touches them afterwards.
 - **Deep Sleep and the LP core** of the Stamp-P4 build are in the kernel and the shim, but have not been run on a Tab5.
-- **No USB drive.** The Stamp-P4 build keeps its configuration on a USB mass-storage drive; the Tab5 has no such port, so `credentials.txt`, `config.txt` and autorun are not reachable from a PC. The files still live in the boot FAT image in flash.
+- **No USB drive.** The Stamp-P4 build keeps its configuration on a USB mass-storage drive; the Tab5 has no such port, so `credentials.txt`, `config.txt` and autorun are not reachable from a PC. They are the same files with the same keys, in the boot FAT image in flash, and are changed on the board with `boot-edit` ([6. Change the configuration](#6-change-the-configuration)). On a Tab5, `boot-edit --put` added a file and the kernel wrote it to flash. After a hardware reset the boot shim started from that copy, and `boot-edit --rm` removed the file the same way. Editing with `vi`, and losing power during a flash write, have not been tried.
 
 Things that are different from the Stamp-P4 image:
 
@@ -94,7 +98,7 @@ Unzip the package and run, from the folder:
 .\flash-candidate.ps1 -Port COM13 -AllowCandidateWrite -StockReadback ..\tab5-stock.bin
 ```
 
-It checks the artifact sizes, writes the bootloader, partition table, boot shim, kernel, root filesystem and DTB, and verifies them. The boot slots (`/boot` with your Wi-Fi settings and credentials) and the A/B metadata are kept by default; `-WriteBoot` writes `boot.img` and resets the A/B choice (needed the first time). `-StockReadback` is optional: it makes the script check that the file is a 16 MiB dump with the SHA-256 `a260eda9…` of the author's unit, so pass `-ExpectedStockSha256 <hash>` with the hash of your own dump, or leave it out.
+Write with this script rather than calling esptool directly: it prints each artifact's SHA-256 and the kernel build it wrote (`Expect after boot: uname -v = …`), so the booted image can be reconciled against what was written. It checks the artifact sizes, writes the bootloader, partition table, boot shim, kernel, root filesystem and DTB, verifies them, and resets the board so Linux boots (pass `-NoReset` to leave it in download mode instead). The boot slots (`/boot` with your Wi-Fi settings and credentials) and the A/B metadata are kept by default; `-WriteBoot` writes `boot.img` and resets the A/B choice (needed the first time). `-StockReadback` is optional: it makes the script check that the file is a 16 MiB dump with the SHA-256 `a260eda9…` of the author's unit, so pass `-ExpectedStockSha256 <hash>` with the hash of your own dump, or leave it out.
 
 The first install needs `-WriteBoot` so that the boot FAT image exists:
 
@@ -176,6 +180,36 @@ Root over SSH is key-only; on the Stamp that needs a file on the USB drive, whic
 
 For everything the userland shares with the Stamp-P4 build (the shell, `vi`, MicroPython, joining another Wi-Fi network, the `/boot` configuration files, Deep Sleep), see the [Stamp-P4 README](https://github.com/tsuyoshi-otake/m5stamp-p4-c6-linux#readme). Its USB-drive instructions do not apply here, and none of it has been re-tested on the Tab5 except where [Status](#status-v010) says so. Serial access, troubleshooting and recovery tips are in [docs/troubleshooting.md](docs/troubleshooting.md).
 
+### 6. Change the configuration
+
+The Stamp-P4 README tells you to open the USB drive and edit `config.txt`, `credentials.txt`, `wpa_supplicant.conf`, `authorized_keys` or the autorun program there. The Tab5 has no USB drive, so do the same on the board, as root, with `boot-edit`:
+
+```sh
+boot-edit --ls                      # what is on the drive
+boot-edit config.txt                # edit with vi; saved when you leave vi
+boot-edit --cat credentials.txt     # print a file
+boot-edit --put authorized_keys < /tmp/id_ed25519.pub
+boot-edit --rm main.py
+```
+
+Everything else is as on the Stamp-P4: a change is checked, written to flash and applied about three seconds later, and the console shows the same `[bootsync] Saved to flash` line. `boot-edit` waits for that line's result and says `saved to flash`, or tells you that the save was not confirmed.
+
+### 7. Keyboard (optional)
+
+The M5Stack Tab5 Keyboard (A164) types on the panel console. Plug it in before or after power-on; the kernel logs `tab5-keyboard: attached` within a second, and unplugging it releases every key it was holding.
+
+The keys work as they do with M5Stack's own firmware:
+
+| Key | What it does |
+| :--- | :--- |
+| `sym`, held | The symbol keys type their second character (`!` becomes `?`, `(` becomes `<`, `.` becomes `,`). |
+| `Aa`, one tap | The next letter is upper case. The left LED blinks until you type it. |
+| `Aa`, two taps | Letters stay upper case until you tap `Aa` again. The left LED stays lit. |
+| `Aa`, held | A Shift key for letters. |
+| `ctrl`, `alt` | As on a PC keyboard: `ctrl` + `c` stops a program. |
+
+The right LED, which the keyboard lights all the time on its own, is kept dark. The left LED's brightness is `m5stack,led-brightness` (0–100, 0 for off) in `linux/dts/esp32p4-tab5.dts`.
+
 ---
 
 ## Security Design
@@ -226,11 +260,10 @@ cd m5stack-tab5-linux
 export IDF_PATH=$PWD/vendor/esp-idf
 . "$IDF_PATH/export.sh"
 
-ES_BOARD=tab5 NOMMU_POOL_BESTFIT=1 NOMMU_USER_RESERVE=1 NOMMU_SYSTEM_MARK=1 \
-    bash linux/build-c68.sh --vendor /path/to/out --profile m3-lab
+ES_BOARD=tab5 bash linux/release-build.sh --vendor /path/to/out --profile m3-lab
 ```
 
-This compiles the boot shim, the Linux 7.2 SMP kernel with the Tab5 device tree and patches, and the Buildroot root filesystem with BusyBox, Dropbear, MicroPython and the ESP-Hosted-NG driver. The three `NOMMU_*` variables are the release settings of the user-pool allocator. Without `ES_BOARD=tab5` the build is for the Stamp-P4.
+`release-build.sh` is the same wrapper the release workflow calls; it sets the three `NOMMU_*` variables that are the release settings of the user-pool allocator, then runs `linux/build-c68.sh`. This compiles the boot shim, the Linux 7.2 SMP kernel with the Tab5 device tree and patches, and the Buildroot root filesystem with BusyBox, Dropbear, MicroPython and the ESP-Hosted-NG driver. Without `ES_BOARD=tab5` the build is for the Stamp-P4.
 
 `linux/tools/package-release.py --board tab5 --build-output /path/to/out --boot-image /path/to/out/buildroot/images/boot.img --output release --version v0.1.0` makes the release files.
 

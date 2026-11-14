@@ -497,8 +497,18 @@ EOF
 	# this point (bootsyncd, SEEN_REF).
 	touch -r /tmp/boot.img /run/.bootsync-seen 2>/dev/null || true
 
+	# A board whose device tree enables no USB device controller (the Tab5)
+	# has no port to show the drive on: there is nothing to load and no
+	# D+ pull-up to switch.  Its drive is changed with boot-edit instead.
+	HAVE_UDC=0
+	for c in /sys/class/udc/*; do
+		[ -e "$c" ] && HAVE_UDC=1
+	done
+
 	# Start USB Mass Storage Gadget on Full-Speed DWC2 (Type-A port)
-	if [ -f /tmp/boot.img ]; then
+	if [ "$HAVE_UDC" -eq 0 ]; then
+		es_log "ES_USB_GADGET SKIP: no USB device controller; use boot-edit for the drive's files"
+	elif [ -f /tmp/boot.img ]; then
 		es_log "ES_USB_GADGET STARTING"
 		USB_SERIAL=$(tr -d : 2>/dev/null < /sys/class/net/wlan0/address || true)
 		if [ -z "$USB_SERIAL" ]; then

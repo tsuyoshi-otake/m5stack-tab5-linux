@@ -2542,6 +2542,21 @@ if $network_profile; then
 		}
 	done
 fi
+if [[ "$board" == "tab5" ]]; then
+	# olddefconfig drops a line without a word when a dependency is
+	# missing, so the panel, its mmap on a kernel without an MMU (#15),
+	# the touch panel and the keyboard are checked in the result.
+	for expected in \
+		"CONFIG_FB_SIMPLE=y" \
+		"CONFIG_FB_PROVIDE_GET_FB_UNMAPPED_AREA=y" \
+		"CONFIG_TOUCHSCREEN_ST7123=y" \
+		"CONFIG_KEYBOARD_TAB5=y"; do
+		grep -Fqx -- "${expected}" "${kernel_config}" || {
+			echo "Tab5 kernel config check failed: ${expected}" >&2
+			exit 1
+		}
+	done
+fi
 if [[ "$stacktrace_diagnostics" == "1" ]]; then
 	for expected in \
 		"CONFIG_STACKTRACE=y" \
