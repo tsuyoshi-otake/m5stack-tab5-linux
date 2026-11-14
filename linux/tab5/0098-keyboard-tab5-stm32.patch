@@ -27,6 +27,12 @@ eight consecutive I/O failures mean detached, in which case every
 held key is released (a gone keyboard reports no releases) and the
 one-a-second watch resumes.
 
+Presence is also verified against silent MCU resets: once a second,
+and on the first successful transfer after an I/O error streak, the
+driver reads KB_MODE back.  A power-dipped MCU keeps answering I2C
+but restarts unconfigured, so a mode mismatch drops the tracked keys
+and replays the configure sequence.
+
 Wire protocol from m5stack M5Tab5-Keyboard-Internal-FW (MIT licensed):
 
   0x00  INT_CFG    bit0/1/2 = key/hid/char event enables
@@ -41,8 +47,8 @@ Signed-off-by: Devin <devin@cognition.ai>
 ---
  drivers/input/keyboard/Kconfig   |   8 +
  drivers/input/keyboard/Makefile  |   1 +
- drivers/input/keyboard/tab5-kbd.c | 493 ++++++++++++++++++++++++++++++
- 3 files changed, 502 insertions(+)
+ drivers/input/keyboard/tab5-kbd.c | 530 ++++++++++++++++++++++++++++++
+ 3 files changed, 539 insertions(+)
 
 diff --git a/drivers/input/keyboard/Kconfig b/drivers/input/keyboard/Kconfig
 --- a/drivers/input/keyboard/Kconfig
@@ -72,7 +78,7 @@ diff --git a/drivers/input/keyboard/tab5-kbd.c b/drivers/input/keyboard/tab5-kbd
 new file mode 100644
 --- /dev/null
 +++ b/drivers/input/keyboard/tab5-kbd.c
-@@ -0,0 +1,493 @@
+@@ -0,0 +1,530 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * M5Stack Tab5 Keyboard (A164) I2C driver.
@@ -118,7 +124,10 @@ new file mode 100644
 + *   present: the usual 25 ms drain; eight consecutive I/O failures
 + *            mean the unit is gone, so every tracked key is released
 + *            (a detached keyboard can never report a release) and the
-+ *            driver returns to absent.
++ *            driver returns to absent.  Once a second, and after any
++ *            I/O error streak, KB_MODE is read back: a unit that
++ *            silently reset still answers I2C but comes up
++ *            unconfigured, so the configure sequence is replayed.
 + *
 + * The STM32 runs its I2C pins with no pull and the stock design
 + * relies on the host's internal pad pull-ups (the ESP-IDF demo sets
@@ -153,6 +162,7 @@ new file mode 100644
 +#define TAB5KBD_POLL_MS		25
 +#define TAB5KBD_PROBE_MS	1000	/* absent: ask for the MCU once a second */
 +#define TAB5KBD_ERR_MAX		8	/* I/O failures that mean detached */
++#define TAB5KBD_MODE_CHECK_POLLS 40	/* ~1 s between KB_MODE checks */
 +
 +#define TAB5KBD_IOMUX_BASE	0x500e1000
 +#define TAB5KBD_IOMUX_PIN(n)	(0x4 + (n) * 0x4)
@@ -167,6 +177,7 @@ new file mode 100644
 +	bool present;
 +	bool absence_reported;
 +	unsigned int io_errors;
++	unsigned int polls_since_check;
 +	u8 brightness;
 +	bool have_brightness;
 +};
@@ -432,6 +443,30 @@ new file mode 100644
 +	return error;
 +}
 +
++/*
++ * A reset MCU keeps answering I2C while dropping every setting, so a
++ * working link alone does not prove the unit still runs the
++ * configured mode -- it comes back in raw key mode, LEDs on and no
++ * HID notifications, which looks exactly like an idle keyboard.  When
++ * KB_MODE has drifted, drop held keys and replay the configure
++ * sequence.  Runs about once a second while attached and on the first
++ * successful transaction after an I/O error streak.
++ */
++static int tab5kbd_check_mode(struct tab5kbd *kbd)
++{
++	u8 mode = 0;
++
++	if (tab5kbd_read(kbd->client, TAB5KBD_REG_KB_MODE, &mode, 1) < 0)
++		return -EIO;
++	if (mode == TAB5KBD_MODE_HID)
++		return 0;
++	dev_warn(&kbd->client->dev,
++		 "tab5-keyboard: MCU dropped to mode %u, reconfiguring\n",
++		 mode);
++	tab5kbd_release_all(kbd);
++	return tab5kbd_configure(kbd) < 0 ? -EIO : 0;
++}
++
 +static void tab5kbd_poll(struct work_struct *work)
 +{
 +	struct tab5kbd *kbd = container_of(to_delayed_work(work),
@@ -448,6 +483,9 @@ new file mode 100644
 +				 "tab5-keyboard: absent, watching for attach\n");
 +		}
 +	} else {
++		bool check = kbd->io_errors != 0 ||
++			++kbd->polls_since_check >= TAB5KBD_MODE_CHECK_POLLS;
++
 +		delay = TAB5KBD_POLL_MS;
 +		if (tab5kbd_drain(kbd) < 0) {
 +			if (++kbd->io_errors >= TAB5KBD_ERR_MAX) {
@@ -461,6 +499,11 @@ new file mode 100644
 +			}
 +		} else {
 +			kbd->io_errors = 0;
++			if (check) {
++				kbd->polls_since_check = 0;
++				if (tab5kbd_check_mode(kbd) < 0)
++					kbd->io_errors = 1;
++			}
 +		}
 +	}
 +	schedule_delayed_work(&kbd->work, msecs_to_jiffies(delay));
@@ -565,4 +608,4 @@ new file mode 100644
 +
 +MODULE_AUTHOR("Devin <devin@cognition.ai>");
 +MODULE_DESCRIPTION("M5Stack Tab5 Keyboard (A164) I2C driver");
-+MODULE_LICENSE("GPL");
++MODULE_LICENSE("GPL");
