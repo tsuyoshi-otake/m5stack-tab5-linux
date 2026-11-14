@@ -19,6 +19,14 @@ the chip FIFO at 40 Hz; the MCU queues events until drained.  Its two
 RGB LEDs stay in the chip's default "binding" mode, so no led device
 is registered.
 
+The unit may be attached after boot, so the driver keeps the input
+device registered at all times and tracks presence itself: while the
+MCU does not answer it asks for VERSION once a second, and a unit
+that replies gets the full configure sequence before polling starts;
+eight consecutive I/O failures mean detached, in which case every
+held key is released (a gone keyboard reports no releases) and the
+one-a-second watch resumes.
+
 Wire protocol from m5stack M5Tab5-Keyboard-Internal-FW (MIT licensed):
 
   0x00  INT_CFG    bit0/1/2 = key/hid/char event enables
@@ -33,8 +41,8 @@ Signed-off-by: Devin <devin@cognition.ai>
 ---
  drivers/input/keyboard/Kconfig   |   8 +
  drivers/input/keyboard/Makefile  |   1 +
- drivers/input/keyboard/tab5-kbd.c | 393 ++++++++++++++++++++++++++++++
- 3 files changed, 402 insertions(+)
+ drivers/input/keyboard/tab5-kbd.c | 493 ++++++++++++++++++++++++++++++
+ 3 files changed, 502 insertions(+)
 
 diff --git a/drivers/input/keyboard/Kconfig b/drivers/input/keyboard/Kconfig
 --- a/drivers/input/keyboard/Kconfig
@@ -64,7 +72,7 @@ diff --git a/drivers/input/keyboard/tab5-kbd.c b/drivers/input/keyboard/tab5-kbd
 new file mode 100644
 --- /dev/null
 +++ b/drivers/input/keyboard/tab5-kbd.c
-@@ -0,0 +1,393 @@
+@@ -0,0 +1,493 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * M5Stack Tab5 Keyboard (A164) I2C driver.
@@ -99,6 +107,19 @@ new file mode 100644
 + * (key-state feedback handled on the chip), so no led device is
 + * registered here.
 + *
++ * Presence tracking: the unit can be attached after boot, and its
++ * MCU resets to a non-HID, LEDs-on state whenever its power drops.
++ * The driver therefore registers the input device unconditionally
++ * and lets the poll work own the attach/detach state machine:
++ *
++ *   absent:  once a second, read VERSION; a unit that answers gets
++ *            the configure sequence (HID mode, FIFO flush, interrupt
++ *            enables, LED brightness) and moves to present.
++ *   present: the usual 25 ms drain; eight consecutive I/O failures
++ *            mean the unit is gone, so every tracked key is released
++ *            (a detached keyboard can never report a release) and the
++ *            driver returns to absent.
++ *
 + * The STM32 runs its I2C pins with no pull and the stock design
 + * relies on the host's internal pad pull-ups (the ESP-IDF demo sets
 + * enable_internal_pullup).  i2c-gpio only toggles direction, so the
@@ -130,6 +151,8 @@ new file mode 100644
 +#define TAB5KBD_USAGE_MAX	0xe8
 +#define TAB5KBD_DRAIN_MAX	32
 +#define TAB5KBD_POLL_MS		25
++#define TAB5KBD_PROBE_MS	1000	/* absent: ask for the MCU once a second */
++#define TAB5KBD_ERR_MAX		8	/* I/O failures that mean detached */
 +
 +#define TAB5KBD_IOMUX_BASE	0x500e1000
 +#define TAB5KBD_IOMUX_PIN(n)	(0x4 + (n) * 0x4)
@@ -141,6 +164,11 @@ new file mode 100644
 +	struct input_dev *input;
 +	struct delayed_work work;
 +	DECLARE_BITMAP(pressed, TAB5KBD_USAGE_MAX);
++	bool present;
++	bool absence_reported;
++	unsigned int io_errors;
++	u8 brightness;
++	bool have_brightness;
 +};
 +
 +/* HID usage -> Linux keycode for the 0x04..0x67 range (0 = unmapped). */
@@ -310,46 +338,138 @@ new file mode 100644
 +	tab5kbd_sync_modifiers(kbd, modifier);
 +}
 +
-+static void tab5kbd_drain(struct tab5kbd *kbd)
++/*
++ * Drop every tracked usage and modifier: a detached keyboard can
++ * never report the releases, so nothing may be left held.
++ */
++static void tab5kbd_release_all(struct tab5kbd *kbd)
++{
++	struct input_dev *input = kbd->input;
++	unsigned long bit;
++
++	for_each_set_bit(bit, kbd->pressed, TAB5KBD_USAGE_MAX) {
++		input_event(input, EV_MSC, MSC_SCAN, bit);
++		input_report_key(input, tab5kbd_code(bit), 0);
++	}
++	bitmap_clear(kbd->pressed, 0, TAB5KBD_USAGE_MAX);
++	input_sync(input);
++}
++
++/*
++ * Push the whole MCU setup: HID mode, FIFO flushed, hid events
++ * enabled, status cleared so INT drops, then the DT-requested
++ * indicator brightness.  Idempotent -- called on probe and on every
++ * re-attach, because a power-cycled MCU comes back unconfigured.
++ */
++static int tab5kbd_configure(struct tab5kbd *kbd)
++{
++	struct i2c_client *client = kbd->client;
++	int error;
++
++	error = tab5kbd_write(client, TAB5KBD_REG_KB_MODE,
++			      TAB5KBD_MODE_HID);
++	if (!error)
++		error = tab5kbd_write(client, TAB5KBD_REG_EVENT_NUM, 0);
++	if (!error)
++		error = tab5kbd_write(client, TAB5KBD_REG_INT_CFG,
++				      TAB5KBD_CFG_HID_EN);
++	if (!error)
++		error = tab5kbd_write(client, TAB5KBD_REG_INT_STA, 0);
++	if (!error && kbd->have_brightness)
++		error = tab5kbd_write(client, TAB5KBD_REG_BRIGHTNESS,
++				      kbd->brightness);
++	return error;
++}
++
++/* Returns true once a unit answered and accepted the configuration. */
++static bool tab5kbd_try_attach(struct tab5kbd *kbd)
++{
++	u8 version = 0;
++
++	if (tab5kbd_read(kbd->client, TAB5KBD_REG_VERSION, &version, 1) < 0)
++		return false;
++	if (tab5kbd_configure(kbd) < 0)
++		return false;
++
++	kbd->present = true;
++	kbd->absence_reported = false;
++	kbd->io_errors = 0;
++	kbd->input->id.version = version;
++	dev_info(&kbd->client->dev,
++		 "tab5-keyboard: attached, fw 0x%02x, polling at %d Hz\n",
++		 version, 1000 / TAB5KBD_POLL_MS);
++	return true;
++}
++
++static int tab5kbd_drain(struct tab5kbd *kbd)
 +{
 +	struct i2c_client *client = kbd->client;
 +	u8 sta[2], ev[2];
 +	unsigned int i;
++	int error = 0;
 +
 +	/* 0x01 reads [INT_STA, EVENT_NUM] in one transaction. */
 +	if (tab5kbd_read(client, TAB5KBD_REG_INT_STA, sta, sizeof(sta)) < 0)
-+		return;
++		return -EIO;
 +	if (!(sta[0] & TAB5KBD_STA_HID) || !sta[1])
-+		return;
++		return 0;
 +	if (sta[1] > TAB5KBD_DRAIN_MAX)
 +		sta[1] = TAB5KBD_DRAIN_MAX;
 +	for (i = 0; i < sta[1]; i++) {
 +		if (tab5kbd_read(client, TAB5KBD_REG_HID_EVENT, ev,
-+				 sizeof(ev)) < 0)
++				 sizeof(ev)) < 0) {
++			error = -EIO;
 +			break;
++		}
 +		if (ev[0] == 0xff && ev[1] == 0xff)
 +			break;
 +		tab5kbd_event(kbd, ev[0], ev[1]);
 +	}
 +	/* Clears pending bits and releases the INT line. */
-+	tab5kbd_write(client, TAB5KBD_REG_INT_STA, 0);
++	if (tab5kbd_write(client, TAB5KBD_REG_INT_STA, 0) < 0)
++		error = -EIO;
 +	input_sync(kbd->input);
++	return error;
 +}
 +
 +static void tab5kbd_poll(struct work_struct *work)
 +{
 +	struct tab5kbd *kbd = container_of(to_delayed_work(work),
 +					   struct tab5kbd, work);
++	unsigned int delay;
 +
-+	tab5kbd_drain(kbd);
-+	schedule_delayed_work(&kbd->work, msecs_to_jiffies(TAB5KBD_POLL_MS));
++	if (!kbd->present) {
++		delay = TAB5KBD_PROBE_MS;
++		if (tab5kbd_try_attach(kbd)) {
++			delay = TAB5KBD_POLL_MS;
++		} else if (!kbd->absence_reported) {
++			kbd->absence_reported = true;
++			dev_info(&kbd->client->dev,
++				 "tab5-keyboard: absent, watching for attach\n");
++		}
++	} else {
++		delay = TAB5KBD_POLL_MS;
++		if (tab5kbd_drain(kbd) < 0) {
++			if (++kbd->io_errors >= TAB5KBD_ERR_MAX) {
++				kbd->present = false;
++				kbd->io_errors = 0;
++				kbd->absence_reported = true;
++				tab5kbd_release_all(kbd);
++				dev_info(&kbd->client->dev,
++					 "tab5-keyboard: detached, watching for attach\n");
++				delay = TAB5KBD_PROBE_MS;
++			}
++		} else {
++			kbd->io_errors = 0;
++		}
++	}
++	schedule_delayed_work(&kbd->work, msecs_to_jiffies(delay));
 +}
 +
 +static int tab5kbd_probe(struct i2c_client *client)
 +{
 +	struct tab5kbd *kbd;
 +	struct input_dev *input;
-+	u8 version = 0;
 +	u32 brightness;
 +	int error, i;
 +
@@ -359,18 +479,22 @@ new file mode 100644
 +
 +	tab5kbd_pull_up_pads(&client->dev);
 +
-+	error = tab5kbd_read(client, TAB5KBD_REG_VERSION, &version, 1);
-+	if (error)
-+		return dev_err_probe(&client->dev, error,
-+				     "no keyboard answer at 0x%02x\n",
-+				     client->addr);
-+
 +	kbd = devm_kzalloc(&client->dev, sizeof(*kbd), GFP_KERNEL);
 +	if (!kbd)
 +		return -ENOMEM;
 +	kbd->client = client;
 +	i2c_set_clientdata(client, kbd);
 +	INIT_DELAYED_WORK(&kbd->work, tab5kbd_poll);
++
++	/*
++	 * Cached so a re-attach replays the board's LED brightness
++	 * request on the freshly powered MCU.
++	 */
++	if (!of_property_read_u32(client->dev.of_node,
++				  "m5stack,led-brightness", &brightness)) {
++		kbd->brightness = min_t(u32, brightness, 255);
++		kbd->have_brightness = true;
++	}
 +
 +	input = devm_input_allocate_device(&client->dev);
 +	if (!input)
@@ -380,7 +504,7 @@ new file mode 100644
 +	input->phys = "tab5-kbd/input0";
 +	input->id.bustype = BUS_I2C;
 +	input->id.vendor = 0x06d;
-+	input->id.version = version;
++	/* id.version is filled by tab5kbd_try_attach once a unit answers. */
 +	input->dev.parent = &client->dev;
 +	input_set_drvdata(input, kbd);
 +
@@ -399,36 +523,20 @@ new file mode 100644
 +				     "input device registration failed\n");
 +
 +	/*
-+	 * Configure the MCU only after the input device exists: HID mode,
-+	 * FIFO flushed, hid events enabled, status cleared so INT drops.
++	 * The unit may not be attached at boot: the input device
++	 * registers regardless, and the poll work keeps asking for the
++	 * MCU until one answers, so a later attach works without a
++	 * manual rebind.
 +	 */
-+	error = tab5kbd_write(client, TAB5KBD_REG_KB_MODE,
-+			      TAB5KBD_MODE_HID);
-+	if (!error)
-+		error = tab5kbd_write(client, TAB5KBD_REG_EVENT_NUM, 0);
-+	if (!error)
-+		error = tab5kbd_write(client, TAB5KBD_REG_INT_CFG,
-+				      TAB5KBD_CFG_HID_EN);
-+	if (!error)
-+		error = tab5kbd_write(client, TAB5KBD_REG_INT_STA, 0);
-+	if (error)
-+		return dev_err_probe(&client->dev, error,
-+				     "keyboard configuration failed\n");
-+
-+	/*
-+	 * Register 0x03 scales both indicator LEDs (Caps state and mode
-+	 * colour); 0 turns them off.  Left at the chip default unless the
-+	 * board asks for a level.
-+	 */
-+	if (!of_property_read_u32(client->dev.of_node,
-+				  "m5stack,led-brightness", &brightness))
-+		tab5kbd_write(client, TAB5KBD_REG_BRIGHTNESS,
-+			      min_t(u32, brightness, 255));
-+
-+	dev_info(&client->dev,
-+		 "tab5-keyboard: fw 0x%02x, polling at %d Hz\n", version,
-+		 1000 / TAB5KBD_POLL_MS);
-+	schedule_delayed_work(&kbd->work, msecs_to_jiffies(TAB5KBD_POLL_MS));
++	if (!tab5kbd_try_attach(kbd)) {
++		kbd->absence_reported = true;
++		dev_info(&client->dev,
++			 "tab5-keyboard: absent, watching for attach\n");
++	}
++	schedule_delayed_work(&kbd->work,
++			      msecs_to_jiffies(kbd->present ?
++					       TAB5KBD_POLL_MS :
++					       TAB5KBD_PROBE_MS));
 +	return 0;
 +}
 +
