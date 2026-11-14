@@ -6,18 +6,19 @@ Tab5's Ext.Port1 keyboard is an STM32F030C8T6 matrix scanner at I2C
 0x6d on a dedicated hw GPIO0 (SDA) / GPIO1 (SCL) pair -- a bus of its
 own, independent of the bit-banged internal bus on GPIO31/32.
 
-HID mode is used because the MCU already owns the Aa/Sym layer state
-machine and the modifier byte: a press event is a complete
-(modifier, usage) pair, a release is (modifier, 0).  The zero-usage
-release names no key, so on release every tracked non-modifier usage
-is dropped and modifiers are re-synced from the byte; self-healing
-when a release spans several held keys.
+KEY mode is used: the MCU reports raw {press, row, col} events, so
+releases carry key identity and the special sym/Aa/ctrl/alt positions
+arrive as plain matrix events.  The driver applies the firmware's
+key_value_map itself: sym acts as a layer switch producing the same
+(modifier, usage) pairs HID mode did, Aa reports KEY_CAPSLOCK so the
+input core owns caps state, and the EV_LED/LED_CAPSL feedback is
+reflected onto LED0 via the RGB user registers (LED1 stays off).
+Synthetic modifiers needed by symbol keys are pressed before the key
+and released after it, refcounted across overlapping positions.
 
 The key-ready interrupt is hw GPIO50 on gpio bank 1, which the
 esp32p4 gpio driver does not wire to an irq_chip, so the driver polls
-the chip FIFO at 40 Hz; the MCU queues events until drained.  Its two
-RGB LEDs stay in the chip's default "binding" mode, so no led device
-is registered.
+the chip FIFO at 40 Hz; the MCU queues events until drained.
 
 The unit may be attached after boot, so the driver keeps the input
 device registered at all times and tracks presence itself: while the
@@ -31,24 +32,28 @@ Presence is also verified against silent MCU resets: once a second,
 and on the first successful transfer after an I/O error streak, the
 driver reads KB_MODE back.  A power-dipped MCU keeps answering I2C
 but restarts unconfigured, so a mode mismatch drops the tracked keys
-and replays the configure sequence.
+and replays the configure sequence, including the RGB user-mode and
+LED state registers.
 
 Wire protocol from m5stack M5Tab5-Keyboard-Internal-FW (MIT licensed):
 
   0x00  INT_CFG    bit0/1/2 = key/hid/char event enables
   0x01  INT_STA    pending event types; write 0 clears + releases INT
   0x02  EVENT_NUM  queued event count; write 0 flushes the FIFO
+  0x03  BRIGHTNESS overall level of the two indicator LEDs
   0x10  KB_MODE    0=key, 1=hid, 2=char
-  0x30  HID_EVENT  pops one entry per read: [modifier, usage];
-                   usage == 0 marks a release, 0xff/0xff means empty
+  0x11  RGB_MODE   0=bind (firmware owns LEDs), 1=user registers
+  0x20  KEY_EVENT  pops one raw event per read:
+                   bit7=pressed, bit6-4=row, bit3-0=col; 0xff = empty
+  0x60..0x67      LED n at +n*4: [B, G, R, reserved]
   0xfe  VERSION    firmware byte
 
 Signed-off-by: Devin <devin@cognition.ai>
 ---
  drivers/input/keyboard/Kconfig   |   8 +
  drivers/input/keyboard/Makefile  |   1 +
- drivers/input/keyboard/tab5-kbd.c | 530 ++++++++++++++++++++++++++++++
- 3 files changed, 539 insertions(+)
+ drivers/input/keyboard/tab5-kbd.c | 753 ++++++++++++++++++++++++++++++
+ 3 files changed, 762 insertions(+)
 
 diff --git a/drivers/input/keyboard/Kconfig b/drivers/input/keyboard/Kconfig
 --- a/drivers/input/keyboard/Kconfig
@@ -78,7 +83,7 @@ diff --git a/drivers/input/keyboard/tab5-kbd.c b/drivers/input/keyboard/tab5-kbd
 new file mode 100644
 --- /dev/null
 +++ b/drivers/input/keyboard/tab5-kbd.c
-@@ -0,0 +1,530 @@
+@@ -0,0 +1,753 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * M5Stack Tab5 Keyboard (A164) I2C driver.
@@ -98,29 +103,45 @@ new file mode 100644
 + *   0x02  EVENT_NUM  queued event count; write 0 flushes the FIFO
 + *   0x03  BRIGHTNESS overall level of the two indicator LEDs
 + *   0x10  KB_MODE    0=key, 1=hid, 2=char
-+ *   0x30  HID_EVENT  pops one entry per read: [modifier, usage];
-+ *                    usage == 0 marks a release, 0xff/0xff means empty
++ *   0x11  RGB_MODE   0=bind (firmware owns LEDs), 1=user registers
++ *   0x20  KEY_EVENT  pops one raw event per read:
++ *                    bit7=pressed, bit6-4=row, bit3-0=col; 0xff = empty
++ *   0x60..0x67      LED n at +n*4: [B, G, R, reserved]
 + *   0xfe  VERSION    firmware byte
 + *
-+ * HID mode is used because the MCU already owns the Aa/Sym layer
-+ * state machine: each press event is a complete (modifier, usage)
-+ * pair and each release is (modifier, 0).  The zero-usage release
-+ * does not name a key, so on release every tracked non-modifier
-+ * usage is dropped and modifiers are re-synced from the byte -- a
-+ * self-healing model when several keys span a release.
++ * KEY mode is used: every physical position reports a raw press or
++ * release of its logical (row, col), so releases carry key identity
++ * (unlike HID mode's anonymous (modifier, 0) release) and the special
++ * sym/Aa/ctrl/alt positions arrive as plain matrix events the driver
++ * maps itself:
 + *
-+ * The MCU's two RGB LEDs stay in their default "binding" mode
-+ * (key-state feedback handled on the chip), so no led device is
-+ * registered here.
++ *   sym  (3,0)  layer switch held in the driver; while down, flagged
++ *               positions emit their second (modifier, usage) entry
++ *               exactly as the MCU's HID layer does -- the produced
++ *               (modifier, usage) pairs are identical.
++ *   Aa   (3,1)  reported as KEY_CAPSLOCK; the input core owns caps
++ *               state and feeds EV_LED/LED_CAPSL back, which the
++ *               driver reflects onto LED0 through the RGB user
++ *               registers.  No caps state is kept here.
++ *   ctrl (4,0)  KEY_LEFTCTRL, alt (4,1) KEY_LEFTALT: real keys that
++ *               also feed the real-modifier mask used when computing
++ *               a flagged position's event.
++ *
++ * The firmware's key_value_map supplies the (modifier, usage) pair
++ * per position and layer; modifiers other than the real ctrl/alt are
++ * synthesised: they are pressed before the key and released after it,
++ * refcounted across positions so overlapping symbol keys share the
++ * synthetic Shift correctly.
 + *
 + * Presence tracking: the unit can be attached after boot, and its
-+ * MCU resets to a non-HID, LEDs-on state whenever its power drops.
++ * MCU resets to a non-configured state whenever its power drops.
 + * The driver therefore registers the input device unconditionally
 + * and lets the poll work own the attach/detach state machine:
 + *
 + *   absent:  once a second, read VERSION; a unit that answers gets
-+ *            the configure sequence (HID mode, FIFO flush, interrupt
-+ *            enables, LED brightness) and moves to present.
++ *            the configure sequence (KEY mode, key-event interrupts,
++ *            FIFO flush, RGB user mode, caps LED, brightness) and
++ *            moves to present.
 + *   present: the usual 25 ms drain; eight consecutive I/O failures
 + *            mean the unit is gone, so every tracked key is released
 + *            (a detached keyboard can never report a release) and the
@@ -149,20 +170,34 @@ new file mode 100644
 +#define TAB5KBD_REG_EVENT_NUM	0x02
 +#define TAB5KBD_REG_BRIGHTNESS	0x03
 +#define TAB5KBD_REG_KB_MODE	0x10
-+#define TAB5KBD_REG_HID_EVENT	0x30
++#define TAB5KBD_REG_RGB_MODE	0x11
++#define TAB5KBD_REG_KEY_EVENT	0x20
++#define TAB5KBD_REG_LED_BASE	0x60
 +#define TAB5KBD_REG_VERSION	0xfe
 +
-+#define TAB5KBD_CFG_HID_EN	0x02
-+#define TAB5KBD_STA_HID		0x02
-+#define TAB5KBD_MODE_HID	0x01
++#define TAB5KBD_CFG_KEY_EN	0x01
++#define TAB5KBD_STA_KEY		0x01
++#define TAB5KBD_MODE_KEY	0x00
++#define TAB5KBD_RGB_USER	0x01
++#define TAB5KBD_KEY_EMPTY	0xff
 +
-+#define TAB5KBD_MOD_FIRST	0xe0	/* HID usages e0..e7 = modifiers */
-+#define TAB5KBD_USAGE_MAX	0xe8
 +#define TAB5KBD_DRAIN_MAX	32
 +#define TAB5KBD_POLL_MS		25
 +#define TAB5KBD_PROBE_MS	1000	/* absent: ask for the MCU once a second */
 +#define TAB5KBD_ERR_MAX		8	/* I/O failures that mean detached */
 +#define TAB5KBD_MODE_CHECK_POLLS 40	/* ~1 s between KB_MODE checks */
++
++#define TAB5KBD_ROWS		5
++#define TAB5KBD_COLS		14
++#define TAB5KBD_POS_MAX		(TAB5KBD_ROWS * TAB5KBD_COLS)
++#define TAB5KBD_POS_SYM		(3 * TAB5KBD_COLS + 0)
++#define TAB5KBD_POS_AA		(3 * TAB5KBD_COLS + 1)
++#define TAB5KBD_POS_CTRL	(4 * TAB5KBD_COLS + 0)
++#define TAB5KBD_POS_ALT		(4 * TAB5KBD_COLS + 1)
++
++#define TAB5KBD_MOD_LCTRL	0x01
++#define TAB5KBD_MOD_LSHIFT	0x02
++#define TAB5KBD_MOD_LALT	0x04
 +
 +#define TAB5KBD_IOMUX_BASE	0x500e1000
 +#define TAB5KBD_IOMUX_PIN(n)	(0x4 + (n) * 0x4)
@@ -173,13 +208,19 @@ new file mode 100644
 +	struct i2c_client *client;
 +	struct input_dev *input;
 +	struct delayed_work work;
-+	DECLARE_BITMAP(pressed, TAB5KBD_USAGE_MAX);
++	struct work_struct led_work;
 +	bool present;
 +	bool absence_reported;
 +	unsigned int io_errors;
 +	unsigned int polls_since_check;
 +	u8 brightness;
 +	bool have_brightness;
++	bool sym_state;
++	bool caps_led;		/* last LED_CAPSL value, for re-apply */
++	u8 mod_real;		/* held real modifiers (ctrl/alt) */
++	u8 mod_synth[8];	/* positions sharing each synthetic mod */
++	u8 pos_mods[TAB5KBD_POS_MAX];	/* synthetic mods raised per pos */
++	u16 pos_code[TAB5KBD_POS_MAX];	/* Linux keycode reported per pos */
 +};
 +
 +/* HID usage -> Linux keycode for the 0x04..0x67 range (0 = unmapped). */
@@ -222,20 +263,63 @@ new file mode 100644
 +	[0x67] = KEY_KPEQUAL,
 +};
 +
-+/* HID usages e0..e7 reported in the modifier byte. */
++/* HID modifier bit (0..7) -> Linux keycode. */
 +static const u16 tab5kbd_modifier_keycode[8] = {
 +	KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_LEFTALT, KEY_LEFTMETA,
 +	KEY_RIGHTCTRL, KEY_RIGHTSHIFT, KEY_RIGHTALT, KEY_RIGHTMETA,
 +};
 +
-+static u16 tab5kbd_code(u8 usage)
-+{
-+	if (usage >= TAB5KBD_MOD_FIRST && usage < TAB5KBD_USAGE_MAX)
-+		return tab5kbd_modifier_keycode[usage - TAB5KBD_MOD_FIRST];
-+	if (usage < ARRAY_SIZE(tab5kbd_keycode))
-+		return tab5kbd_keycode[usage];
-+	return 0;
-+}
++/*
++ * Per-position table transcribed from the MCU's key_value_map:
++ * {plain modifier mask, plain HID usage, sym modifier mask, sym usage}.
++ * Letter rows' modifier fields are unused -- a letter always emits
++ * its plain usage with the real-modifier mask, matching the MCU's
++ * letter path; caps is Linux's job.  Special positions (sym/Aa/
++ * ctrl/alt) carry {0,0,0,0} and are decoded before the lookup.
++ */
++static const u8 tab5kbd_map[TAB5KBD_ROWS][TAB5KBD_COLS][4] = {
++	{ /* row 0: esc 1 2 3 4 5 6 7 8 9 0 - + del */
++		{ 0, 0x29, 0, 0x29 },	{ 0, 0x1e, 0, 0x1e },
++		{ 0, 0x1f, 0, 0x1f },	{ 0, 0x20, 0, 0x20 },
++		{ 0, 0x21, 0, 0x21 },	{ 0, 0x22, 0, 0x22 },
++		{ 0, 0x23, 0, 0x23 },	{ 0, 0x24, 0, 0x24 },
++		{ 0, 0x25, 0, 0x25 },	{ 0, 0x26, 0, 0x26 },
++		{ 0, 0x27, 0, 0x27 },	{ 0, 0x2d, 0, 0x2d },
++		{ 2, 0x2e, 2, 0x2e },	{ 0, 0x4c, 0, 0x4c },
++	}, { /* row 1: ` ! @ # $ % ^ & * ( ) [ ] \ */
++		{ 0, 0x35, 2, 0x35 },	{ 2, 0x1e, 2, 0x38 },
++		{ 2, 0x1f, 2, 0x1f },	{ 2, 0x20, 2, 0x20 },
++		{ 2, 0x21, 2, 0x21 },	{ 2, 0x22, 2, 0x22 },
++		{ 2, 0x23, 2, 0x23 },	{ 2, 0x24, 2, 0x24 },
++		{ 2, 0x25, 0, 0x38 },	{ 2, 0x26, 2, 0x36 },
++		{ 2, 0x27, 2, 0x37 },	{ 0, 0x2f, 2, 0x2f },
++		{ 0, 0x30, 2, 0x30 },	{ 0, 0x31, 2, 0x31 },
++	}, { /* row 2: tab q w e r t y u i o p ; ' backspace */
++		{ 0, 0x2b, 0, 0x2b },	{ 0, 0x14, 2, 0x14 },
++		{ 0, 0x1a, 2, 0x1a },	{ 0, 0x08, 2, 0x08 },
++		{ 0, 0x15, 2, 0x15 },	{ 0, 0x17, 2, 0x17 },
++		{ 0, 0x1c, 2, 0x1c },	{ 0, 0x18, 2, 0x18 },
++		{ 0, 0x0c, 2, 0x0c },	{ 0, 0x12, 2, 0x12 },
++		{ 0, 0x13, 2, 0x13 },	{ 0, 0x33, 2, 0x33 },
++		{ 0, 0x34, 2, 0x34 },	{ 0, 0x2a, 0, 0x2a },
++	}, { /* row 3: sym Aa a s d f g h j k l up _ enter */
++		{ 0, 0, 0, 0 },		{ 0, 0, 0, 0 },
++		{ 0, 0x04, 2, 0x04 },	{ 0, 0x16, 2, 0x16 },
++		{ 0, 0x07, 2, 0x07 },	{ 0, 0x09, 2, 0x09 },
++		{ 0, 0x0a, 2, 0x0a },	{ 0, 0x0b, 2, 0x0b },
++		{ 0, 0x0d, 2, 0x0d },	{ 0, 0x0e, 2, 0x0e },
++		{ 0, 0x0f, 2, 0x0f },	{ 0, 0x52, 0, 0x52 },
++		{ 2, 0x2d, 0, 0x2e },	{ 0, 0x28, 0, 0x28 },
++	}, { /* row 4: ctrl alt z x c v b n m . left down right space */
++		{ 0, 0, 0, 0 },		{ 0, 0, 0, 0 },
++		{ 2, 0x1d, 2, 0x1d },	{ 2, 0x1b, 2, 0x1b },
++		{ 2, 0x06, 2, 0x06 },	{ 2, 0x19, 2, 0x19 },
++		{ 2, 0x05, 2, 0x05 },	{ 2, 0x11, 2, 0x11 },
++		{ 2, 0x10, 2, 0x10 },	{ 0, 0x37, 0, 0x36 },
++		{ 0, 0x50, 0, 0x50 },	{ 0, 0x51, 0, 0x51 },
++		{ 0, 0x4f, 0, 0x4f },	{ 0, 0x2c, 0, 0x2c },
++	},
++};
 +
 +/*
 + * Enable the host-side pad pull-ups the keyboard's bus design
@@ -291,86 +375,216 @@ new file mode 100644
 +	       0 : -EIO;
 +}
 +
-+/* Bring the reported modifier keys in line with the modifier byte. */
-+static void tab5kbd_sync_modifiers(struct tab5kbd *kbd, u8 modifier)
++static int tab5kbd_write_buf(struct i2c_client *client, u8 reg,
++			     const u8 *vals, u8 len)
 +{
-+	struct input_dev *input = kbd->input;
-+	unsigned int i;
++	u8 buf[9];
 +
-+	for (i = 0; i < 8; i++) {
-+		unsigned int mod = TAB5KBD_MOD_FIRST + i;
-+
-+		if (modifier & BIT(i)) {
-+			if (!test_and_set_bit(mod, kbd->pressed)) {
-+				input_event(input, EV_MSC, MSC_SCAN, mod);
-+				input_report_key(input,
-+						 tab5kbd_modifier_keycode[i], 1);
-+			}
-+		} else if (test_and_clear_bit(mod, kbd->pressed)) {
-+			input_event(input, EV_MSC, MSC_SCAN, mod);
-+			input_report_key(input,
-+					 tab5kbd_modifier_keycode[i], 0);
-+		}
-+	}
++	if (len > sizeof(buf) - 1)
++		return -EINVAL;
++	buf[0] = reg;
++	memcpy(buf + 1, vals, len);
++	return i2c_master_send(client, buf, len + 1) == len + 1 ? 0 : -EIO;
 +}
 +
-+static void tab5kbd_event(struct tab5kbd *kbd, u8 modifier, u8 usage)
++/* LED n occupies registers 0x60+n*4 .. +3 as [B, G, R, reserved]. */
++static int tab5kbd_set_led(struct tab5kbd *kbd, unsigned int idx,
++			   u8 b, u8 g, u8 r)
 +{
-+	struct input_dev *input = kbd->input;
-+	unsigned long bit;
++	u8 v[4] = { b, g, r, 0 };
 +
-+	if (usage) {
-+		u16 code = tab5kbd_code(usage);
-+
-+		/*
-+		 * Modifiers go first.  The MCU sends its symbol keys as a
-+		 * shifted usage ('!' is LeftShift + '1'), so Shift must be
-+		 * down before the key, and a Shift left over from the
-+		 * previous symbol must be up before a plain key.
-+		 */
-+		tab5kbd_sync_modifiers(kbd, modifier);
-+		if (code && !test_and_set_bit(usage, kbd->pressed)) {
-+			input_event(input, EV_MSC, MSC_SCAN, usage);
-+			input_report_key(input, code, 1);
-+		}
-+		return;
-+	}
-+
-+	/*
-+	 * A zero usage is a bare release with no key identity: drop
-+	 * every tracked non-modifier usage first, then re-sync the
-+	 * modifiers to what the byte still reports as held.
-+	 */
-+	for_each_set_bit(bit, kbd->pressed, TAB5KBD_MOD_FIRST) {
-+		input_event(input, EV_MSC, MSC_SCAN, bit);
-+		input_report_key(input, tab5kbd_keycode[bit], 0);
-+	}
-+	bitmap_clear(kbd->pressed, 0, TAB5KBD_MOD_FIRST);
-+	tab5kbd_sync_modifiers(kbd, modifier);
++	return tab5kbd_write_buf(kbd->client,
++				 TAB5KBD_REG_LED_BASE + idx * 4, v, 4);
 +}
 +
 +/*
-+ * Drop every tracked usage and modifier: a detached keyboard can
++ * LED0 shows the input core's caps state, LED1 (the MCU's mode
++ * indicator) stays dark.  Firmware's AA_INDICATOR_LIGHT colour.
++ */
++static int tab5kbd_apply_leds(struct tab5kbd *kbd)
++{
++	int error;
++
++	error = tab5kbd_set_led(kbd, 1, 0, 0, 0);
++	if (!error)
++		error = tab5kbd_set_led(kbd, 0,
++					kbd->caps_led ? 0xff : 0, 0, 0);
++	return error;
++}
++
++static void tab5kbd_led_work(struct work_struct *work)
++{
++	struct tab5kbd *kbd = container_of(work, struct tab5kbd, led_work);
++
++	if (kbd->present)
++		tab5kbd_apply_leds(kbd);
++}
++
++/* The input core owns caps state and feeds it back here. */
++static int tab5kbd_event_cb(struct input_dev *input, unsigned int type,
++			    unsigned int code, int value)
++{
++	struct tab5kbd *kbd = input_get_drvdata(input);
++
++	if (type == EV_LED && code == LED_CAPSL) {
++		kbd->caps_led = !!value;
++		schedule_work(&kbd->led_work);
++	}
++	return 0;
++}
++
++static void tab5kbd_mod_report(struct input_dev *input, unsigned int bit,
++			       int value)
++{
++	input_event(input, EV_MSC, MSC_SCAN, 0xe0 + bit);
++	input_report_key(input, tab5kbd_modifier_keycode[bit], value);
++}
++
++/*
++ * Raise the synthetic modifiers a position needs (modifiers not held
++ * for real).  Needed bits already raised by another position just
++ * bump the shared refcount so the last holder drops the line.
++ */
++static void tab5kbd_mod_raise(struct tab5kbd *kbd, unsigned int kid, u8 mods)
++{
++	unsigned int b;
++
++	for (b = 0; b < 8; b++) {
++		if (!(mods & BIT(b)) || (kbd->mod_real & BIT(b)))
++			continue;
++		if (!kbd->mod_synth[b])
++			tab5kbd_mod_report(kbd->input, b, 1);
++		kbd->mod_synth[b]++;
++		kbd->pos_mods[kid] |= BIT(b);
++	}
++}
++
++/* Drop the synthetic modifiers a position raised at press time. */
++static void tab5kbd_mod_drop(struct tab5kbd *kbd, unsigned int kid)
++{
++	unsigned int b;
++
++	for (b = 0; b < 8; b++) {
++		if (!(kbd->pos_mods[kid] & BIT(b)))
++			continue;
++		if (kbd->mod_synth[b])
++			kbd->mod_synth[b]--;
++		if (!kbd->mod_synth[b] && !(kbd->mod_real & BIT(b)))
++			tab5kbd_mod_report(kbd->input, b, 0);
++	}
++	kbd->pos_mods[kid] = 0;
++}
++
++/*
++ * One raw event: bit7 pressed, bit6-4 row, bit3-0 col of the logical
++ * 5x14 matrix.  On press the issued (modifiers, keycode) is recorded
++ * per position so the release undoes exactly that -- the raw stream
++ * identifies the released position, so nothing else is dropped.
++ */
++static void tab5kbd_key_event(struct tab5kbd *kbd, u8 raw)
++{
++	struct input_dev *input = kbd->input;
++	bool pressed = !!(raw & 0x80);
++	unsigned int row = (raw >> 4) & 0x7;
++	unsigned int col = raw & 0xf;
++	unsigned int kid = row * TAB5KBD_COLS + col;
++	unsigned int b;
++	u16 code;
++
++	if (row >= TAB5KBD_ROWS || col >= TAB5KBD_COLS)
++		return;
++	input_event(input, EV_MSC, MSC_SCAN, raw);
++
++	switch (kid) {
++	case TAB5KBD_POS_SYM:
++		kbd->sym_state = pressed;
++		return;
++	case TAB5KBD_POS_AA:
++		input_report_key(input, KEY_CAPSLOCK, pressed);
++		return;
++	case TAB5KBD_POS_CTRL:
++	case TAB5KBD_POS_ALT:
++		b = kid == TAB5KBD_POS_CTRL ? 0 : 2;
++		if (pressed)
++			kbd->mod_real |= BIT(b);
++		else
++			kbd->mod_real &= ~BIT(b);
++		tab5kbd_mod_report(input, b, pressed);
++		kbd->pos_code[kid] = pressed ?
++			tab5kbd_modifier_keycode[b] : 0;
++		return;
++	}
++
++	if (pressed) {
++		const u8 *pos = tab5kbd_map[row][col];
++		bool letter = pos[1] >= 0x04 && pos[1] <= 0x1d;
++		bool has_sym = pos[0] != pos[2] || pos[1] != pos[3];
++		u8 mods;
++		u8 usage;
++
++		if (letter) {
++			mods = kbd->mod_real;
++			usage = pos[1];
++		} else if (has_sym) {
++			if (kbd->sym_state) {
++				mods = kbd->mod_real | pos[2];
++				usage = pos[3];
++			} else {
++				mods = pos[0];
++				usage = pos[1];
++			}
++		} else {
++			mods = kbd->mod_real | pos[0];
++			usage = pos[1];
++		}
++
++		code = tab5kbd_keycode[usage];
++		if (!code)
++			return;
++		tab5kbd_mod_raise(kbd, kid, mods);
++		input_report_key(input, code, 1);
++		kbd->pos_code[kid] = code;
++	} else {
++		code = kbd->pos_code[kid];
++		if (code)
++			input_report_key(input, code, 0);
++		tab5kbd_mod_drop(kbd, kid);
++		kbd->pos_code[kid] = 0;
++	}
++}
++
++/*
++ * Drop every tracked key and modifier: a detached keyboard can
 + * never report the releases, so nothing may be left held.
 + */
 +static void tab5kbd_release_all(struct tab5kbd *kbd)
 +{
 +	struct input_dev *input = kbd->input;
-+	unsigned long bit;
++	unsigned int kid, b;
 +
-+	for_each_set_bit(bit, kbd->pressed, TAB5KBD_USAGE_MAX) {
-+		input_event(input, EV_MSC, MSC_SCAN, bit);
-+		input_report_key(input, tab5kbd_code(bit), 0);
++	for (kid = 0; kid < TAB5KBD_POS_MAX; kid++) {
++		if (kbd->pos_code[kid])
++			input_report_key(input, kbd->pos_code[kid], 0);
++		kbd->pos_code[kid] = 0;
++		kbd->pos_mods[kid] = 0;
 +	}
-+	bitmap_clear(kbd->pressed, 0, TAB5KBD_USAGE_MAX);
++	for (b = 0; b < 8; b++) {
++		if (kbd->mod_synth[b])
++			tab5kbd_mod_report(input, b, 0);
++		kbd->mod_synth[b] = 0;
++	}
++	kbd->mod_real = 0;
++	kbd->sym_state = false;
 +	input_sync(input);
 +}
 +
 +/*
-+ * Push the whole MCU setup: HID mode, FIFO flushed, hid events
-+ * enabled, status cleared so INT drops, then the DT-requested
-+ * indicator brightness.  Idempotent -- called on probe and on every
-+ * re-attach, because a power-cycled MCU comes back unconfigured.
++ * Push the whole MCU setup: KEY mode, FIFO flushed, key events
++ * enabled, status cleared so INT drops, RGB user mode with the mode
++ * indicator off and the caps LED restored, then the DT-requested
++ * brightness.  Idempotent -- called on probe, on every re-attach,
++ * and after a silent MCU reset, because an unconfigured MCU comes
++ * back in raw defaults.
 + */
 +static int tab5kbd_configure(struct tab5kbd *kbd)
 +{
@@ -378,17 +592,22 @@ new file mode 100644
 +	int error;
 +
 +	error = tab5kbd_write(client, TAB5KBD_REG_KB_MODE,
-+			      TAB5KBD_MODE_HID);
++			      TAB5KBD_MODE_KEY);
 +	if (!error)
 +		error = tab5kbd_write(client, TAB5KBD_REG_EVENT_NUM, 0);
 +	if (!error)
 +		error = tab5kbd_write(client, TAB5KBD_REG_INT_CFG,
-+				      TAB5KBD_CFG_HID_EN);
++				      TAB5KBD_CFG_KEY_EN);
 +	if (!error)
 +		error = tab5kbd_write(client, TAB5KBD_REG_INT_STA, 0);
++	if (!error)
++		error = tab5kbd_write(client, TAB5KBD_REG_RGB_MODE,
++				      TAB5KBD_RGB_USER);
 +	if (!error && kbd->have_brightness)
 +		error = tab5kbd_write(client, TAB5KBD_REG_BRIGHTNESS,
 +				      kbd->brightness);
++	if (!error)
++		error = tab5kbd_apply_leds(kbd);
 +	return error;
 +}
 +
@@ -415,26 +634,25 @@ new file mode 100644
 +static int tab5kbd_drain(struct tab5kbd *kbd)
 +{
 +	struct i2c_client *client = kbd->client;
-+	u8 sta[2], ev[2];
++	u8 sta[2], ev;
 +	unsigned int i;
 +	int error = 0;
 +
 +	/* 0x01 reads [INT_STA, EVENT_NUM] in one transaction. */
 +	if (tab5kbd_read(client, TAB5KBD_REG_INT_STA, sta, sizeof(sta)) < 0)
 +		return -EIO;
-+	if (!(sta[0] & TAB5KBD_STA_HID) || !sta[1])
++	if (!(sta[0] & TAB5KBD_STA_KEY) || !sta[1])
 +		return 0;
 +	if (sta[1] > TAB5KBD_DRAIN_MAX)
 +		sta[1] = TAB5KBD_DRAIN_MAX;
 +	for (i = 0; i < sta[1]; i++) {
-+		if (tab5kbd_read(client, TAB5KBD_REG_HID_EVENT, ev,
-+				 sizeof(ev)) < 0) {
++		if (tab5kbd_read(client, TAB5KBD_REG_KEY_EVENT, &ev, 1) < 0) {
 +			error = -EIO;
 +			break;
 +		}
-+		if (ev[0] == 0xff && ev[1] == 0xff)
++		if (ev == TAB5KBD_KEY_EMPTY)
 +			break;
-+		tab5kbd_event(kbd, ev[0], ev[1]);
++		tab5kbd_key_event(kbd, ev);
 +	}
 +	/* Clears pending bits and releases the INT line. */
 +	if (tab5kbd_write(client, TAB5KBD_REG_INT_STA, 0) < 0)
@@ -447,10 +665,10 @@ new file mode 100644
 + * A reset MCU keeps answering I2C while dropping every setting, so a
 + * working link alone does not prove the unit still runs the
 + * configured mode -- it comes back in raw key mode, LEDs on and no
-+ * HID notifications, which looks exactly like an idle keyboard.  When
-+ * KB_MODE has drifted, drop held keys and replay the configure
-+ * sequence.  Runs about once a second while attached and on the first
-+ * successful transaction after an I/O error streak.
++ * key-event notifications, which looks exactly like an idle
++ * keyboard.  When KB_MODE has drifted, drop held keys and replay the
++ * configure sequence.  Runs about once a second while attached and
++ * on the first successful transaction after an I/O error streak.
 + */
 +static int tab5kbd_check_mode(struct tab5kbd *kbd)
 +{
@@ -458,7 +676,7 @@ new file mode 100644
 +
 +	if (tab5kbd_read(kbd->client, TAB5KBD_REG_KB_MODE, &mode, 1) < 0)
 +		return -EIO;
-+	if (mode == TAB5KBD_MODE_HID)
++	if (mode == TAB5KBD_MODE_KEY)
 +		return 0;
 +	dev_warn(&kbd->client->dev,
 +		 "tab5-keyboard: MCU dropped to mode %u, reconfiguring\n",
@@ -514,7 +732,7 @@ new file mode 100644
 +	struct tab5kbd *kbd;
 +	struct input_dev *input;
 +	u32 brightness;
-+	int error, i;
++	int error, i, j;
 +
 +	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C))
 +		return dev_err_probe(&client->dev, -ENXIO,
@@ -528,6 +746,7 @@ new file mode 100644
 +	kbd->client = client;
 +	i2c_set_clientdata(client, kbd);
 +	INIT_DELAYED_WORK(&kbd->work, tab5kbd_poll);
++	INIT_WORK(&kbd->led_work, tab5kbd_led_work);
 +
 +	/*
 +	 * Cached so a re-attach replays the board's LED brightness
@@ -549,14 +768,22 @@ new file mode 100644
 +	input->id.vendor = 0x06d;
 +	/* id.version is filled by tab5kbd_try_attach once a unit answers. */
 +	input->dev.parent = &client->dev;
++	input->event = tab5kbd_event_cb;
 +	input_set_drvdata(input, kbd);
 +
 +	__set_bit(EV_KEY, input->evbit);
 +	__set_bit(EV_REP, input->evbit);
 +	input_set_capability(input, EV_MSC, MSC_SCAN);
-+	for (i = 0; i < ARRAY_SIZE(tab5kbd_keycode); i++)
-+		if (tab5kbd_keycode[i])
-+			__set_bit(tab5kbd_keycode[i], input->keybit);
++	input_set_capability(input, EV_LED, LED_CAPSL);
++	__set_bit(KEY_CAPSLOCK, input->keybit);
++	for (i = 0; i < TAB5KBD_ROWS; i++)
++		for (j = 0; j < TAB5KBD_COLS; j++)
++			for (error = 1; error < 4; error += 2) {
++				u16 code = tab5kbd_keycode[tab5kbd_map[i][j][error]];
++
++				if (code)
++					__set_bit(code, input->keybit);
++			}
 +	for (i = 0; i < 8; i++)
 +		__set_bit(tab5kbd_modifier_keycode[i], input->keybit);
 +
@@ -588,6 +815,7 @@ new file mode 100644
 +	struct tab5kbd *kbd = i2c_get_clientdata(client);
 +
 +	cancel_delayed_work_sync(&kbd->work);
++	cancel_work_sync(&kbd->led_work);
 +}
 +
 +static const struct of_device_id tab5kbd_of_match[] = {
