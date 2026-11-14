@@ -23,6 +23,14 @@
  *      once the last user closes.
  *
  * Watch on the device: the bands must appear complete, not in pieces.
+ *
+ * One black character cell in the picture is not a fault.  The text
+ * console still owns the panel and repaints the cell under its cursor
+ * every time the cursor blinks.  Hide the cursor first to get a clean
+ * picture, and show it again afterwards:
+ *
+ *   printf '\033[?25l' > /dev/tty1
+ *   printf '\033[?25h' > /dev/tty1
  */
 
 #include <errno.h>
