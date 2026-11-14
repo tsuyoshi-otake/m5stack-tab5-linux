@@ -22,7 +22,7 @@
 / {
 	#address-cells = <1>;
 	#size-cells = <1>;
-	model = "M5Stack Tab5 (WIP)";
+	model = "M5Stack Tab5";
 	compatible = "m5stack,tab5", "espressif,esp32p4";
 
 	cpus {
