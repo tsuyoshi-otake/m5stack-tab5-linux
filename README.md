@@ -226,11 +226,10 @@ cd m5stack-tab5-linux
 export IDF_PATH=$PWD/vendor/esp-idf
 . "$IDF_PATH/export.sh"
 
-ES_BOARD=tab5 NOMMU_POOL_BESTFIT=1 NOMMU_USER_RESERVE=1 NOMMU_SYSTEM_MARK=1 \
-    bash linux/build-c68.sh --vendor /path/to/out --profile m3-lab
+ES_BOARD=tab5 bash linux/release-build.sh --vendor /path/to/out --profile m3-lab
 ```
 
-This compiles the boot shim, the Linux 7.2 SMP kernel with the Tab5 device tree and patches, and the Buildroot root filesystem with BusyBox, Dropbear, MicroPython and the ESP-Hosted-NG driver. The three `NOMMU_*` variables are the release settings of the user-pool allocator. Without `ES_BOARD=tab5` the build is for the Stamp-P4.
+`release-build.sh` is the same wrapper the release workflow calls; it sets the three `NOMMU_*` variables that are the release settings of the user-pool allocator, then runs `linux/build-c68.sh`. This compiles the boot shim, the Linux 7.2 SMP kernel with the Tab5 device tree and patches, and the Buildroot root filesystem with BusyBox, Dropbear, MicroPython and the ESP-Hosted-NG driver. Without `ES_BOARD=tab5` the build is for the Stamp-P4.
 
 `linux/tools/package-release.py --board tab5 --build-output /path/to/out --boot-image /path/to/out/buildroot/images/boot.img --output release --version v0.1.0` makes the release files.
 
