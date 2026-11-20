@@ -1,0 +1,368 @@
+Subject: [PATCH tab5] misc: esp32p4_cam: /dev/video0 V4L2 read()
+ interface for the CSI camera
+
+Registers a video_device next to /dev/cam0 (#44).  One fixed
+format -- V4L2_PIX_FMT_SBGGR8 1280x720, bytesperline 1280,
+sizeimage 921600 -- with querycap, enum_fmt, g/s/try_fmt,
+enum_framesizes and a single camera input; read() reuses the
+existing 1 MiB coherent buffer and the same prepare+capture path
+as cam0.  No V4L2_CAP_STREAMING: a buffer queue means videobuf2
+or a second frame allocation and the board has ~2 MB free, so
+READWRITE only.
+
+The sensor init table stays in user space where it already lives
+(cam-dump -S holds the rail open for video0 readers); the kernel
+keeps zero bytes of register state.  opens counts both nodes so
+the last close of either disarms the pipe and drops CAM_RST, and
+a mutex serializes capture across the two nodes.  remove()
+unregisters the video device and frees everything probe took.
+All of it sits under IS_ENABLED(CONFIG_VIDEO_DEV) so the misc
+driver still builds and works without the V4L2 core.
+
+ 1 file changed, 238 insertions(+), 14 deletions(-)
+
+--- a/drivers/misc/esp32p4_cam.c	2026-11-20 16:10:32.468632600 +0900
++++ b/drivers/misc/esp32p4_cam.c	2026-11-20 16:10:32.524344100 +0900
+@@ -16,10 +16,18 @@
+ #include <linux/ioport.h>
+ #include <linux/miscdevice.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/uaccess.h>
+ 
++#if IS_ENABLED(CONFIG_VIDEO_DEV)
++#include <media/v4l2-dev.h>
++#include <media/v4l2-device.h>
++#include <media/v4l2-fh.h>
++#include <media/v4l2-ioctl.h>
++#endif
++
+ #define CAM_IOC_PREPARE		_IO('C', 1)
+ 
+ #define CAM_H_RES		1280
+@@ -167,6 +175,12 @@
+ 	void __iomem *pmu;
+ 	struct gpio_desc *rst;
+ 	struct miscdevice misc;
++	struct mutex lock;
++	int opens;
++#if IS_ENABLED(CONFIG_VIDEO_DEV)
++	struct v4l2_device v4l2_dev;
++	struct video_device vdev;
++#endif
+ 	void *fb_va;
+ 	dma_addr_t fb_pa;
+ 	u32 chan;
+@@ -472,11 +486,9 @@
+ 	return -ETIMEDOUT;
+ }
+ 
+-static ssize_t cam_read(struct file *f, char __user *buf, size_t cnt,
+-			loff_t *pos)
++static ssize_t cam_do_read(struct esp32p4_cam *c, char __user *buf,
++			   size_t cnt, loff_t *pos)
+ {
+-	struct esp32p4_cam *c =
+-		container_of(f->private_data, struct esp32p4_cam, misc);
+ 	int ret;
+ 
+ 	if (*pos == 0) {
+@@ -490,6 +502,19 @@
+ 				       CAM_FRAME_BYTES);
+ }
+ 
++static ssize_t cam_read(struct file *f, char __user *buf, size_t cnt,
++			loff_t *pos)
++{
++	struct esp32p4_cam *c =
++		container_of(f->private_data, struct esp32p4_cam, misc);
++	ssize_t ret;
++
++	mutex_lock(&c->lock);
++	ret = cam_do_read(c, buf, cnt, pos);
++	mutex_unlock(&c->lock);
++	return ret;
++}
++
+ static long cam_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+ {
+ 	struct esp32p4_cam *c =
+@@ -500,37 +525,229 @@
+ 	return cam_prepare(c);
+ }
+ 
+-/* The camera rail is powered only while /dev/cam0 is open: the
+- * last close disarms the pipeline and drops CAM_RST.  The frame
+- * buffer stays -- it is held for the driver's lifetime so every
+- * open gets the same working order-8 block. */
++/* The camera rail is powered only while a device node is open: the
++ * last close (of /dev/cam0 or /dev/video0) disarms the pipeline and
++ * drops CAM_RST.  opens counts both nodes so a v4l2 client cannot
++ * pull power from under a cam-dump setup session or vice versa.
++ * The frame buffer stays -- it is held for the driver's lifetime so
++ * every open gets the same working order-8 block. */
++static void cam_powerdown(struct esp32p4_cam *c)
++{
++	writel(0, c->brg + BRG_CSI_EN);
++	writel(GDMA_CHEN_DIS(c->chan), c->gdma + GDMA_CHEN0);
++	gpiod_set_value_cansleep(c->rst, 0);
++	c->prepared = false;
++}
++
++static int cam_open(struct inode *ino, struct file *f)
++{
++	struct esp32p4_cam *c =
++		container_of(f->private_data, struct esp32p4_cam, misc);
++
++	mutex_lock(&c->lock);
++	c->opens++;
++	mutex_unlock(&c->lock);
++	return 0;
++}
++
+ static int cam_release(struct inode *ino, struct file *f)
+ {
+ 	struct esp32p4_cam *c =
+ 		container_of(f->private_data, struct esp32p4_cam, misc);
+ 
+-	if (c->prepared) {
+-		writel(0, c->brg + BRG_CSI_EN);
+-		writel(GDMA_CHEN_DIS(c->chan), c->gdma + GDMA_CHEN0);
+-		gpiod_set_value_cansleep(c->rst, 0);
+-		c->prepared = false;
++	mutex_lock(&c->lock);
++	if (--c->opens <= 0) {
++		c->opens = 0;
++		cam_powerdown(c);
+ 	}
++	mutex_unlock(&c->lock);
+ 	return 0;
+ }
+ 
+ static const struct file_operations cam_fops = {
+ 	.owner = THIS_MODULE,
++	.open = cam_open,
+ 	.read = cam_read,
+ 	.unlocked_ioctl = cam_ioctl,
+ 	.release = cam_release,
+ 	.llseek = noop_llseek,
+ };
+ 
++#if IS_ENABLED(CONFIG_VIDEO_DEV)
++/* ---- /dev/video0: the same frame, through the V4L2 read() API ----
++ * One fixed format, no buffer queue: read() reuses the same 1 MiB
++ * coherent buffer and the same capture path as /dev/cam0.  The
++ * sensor init table stays in user space (cam-dump --setup holds the
++ * rail open); the kernel keeps zero bytes of register state. */
++
++static int cam_v4l2_open(struct file *f)
++{
++	struct esp32p4_cam *c = video_drvdata(f);
++	int ret;
++
++	ret = v4l2_fh_open(f);
++	if (ret)
++		return ret;
++	mutex_lock(&c->lock);
++	c->opens++;
++	mutex_unlock(&c->lock);
++	return 0;
++}
++
++static int cam_v4l2_release(struct file *f)
++{
++	struct esp32p4_cam *c = video_drvdata(f);
++
++	mutex_lock(&c->lock);
++	if (--c->opens <= 0) {
++		c->opens = 0;
++		cam_powerdown(c);
++	}
++	mutex_unlock(&c->lock);
++	return v4l2_fh_release(f);
++}
++
++static ssize_t cam_v4l2_read(struct file *f, char __user *buf,
++			     size_t cnt, loff_t *pos)
++{
++	struct esp32p4_cam *c = video_drvdata(f);
++	ssize_t ret;
++
++	mutex_lock(&c->lock);
++	ret = cam_do_read(c, buf, cnt, pos);
++	mutex_unlock(&c->lock);
++	return ret;
++}
++
++static int cam_querycap(struct file *f, void *priv,
++			struct v4l2_capability *cap)
++{
++	struct esp32p4_cam *c = video_drvdata(f);
++
++	strscpy(cap->driver, "esp32p4-csi-cam", sizeof(cap->driver));
++	strscpy(cap->card, "ESP32-P4 CSI camera (Tab5)", sizeof(cap->card));
++	snprintf(cap->bus_info, sizeof(cap->bus_info), "platform:%s",
++		 dev_name(c->dev));
++	cap->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_READWRITE;
++	cap->capabilities = cap->device_caps | V4L2_CAP_DEVICE_CAPS;
++	return 0;
++}
++
++static int cam_enum_fmt(struct file *f, void *priv,
++			struct v4l2_fmtdesc *fd)
++{
++	if (fd->index || fd->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
++		return -EINVAL;
++	fd->pixelformat = V4L2_PIX_FMT_SBGGR8;
++	strscpy(fd->description, "8-bit Bayer BGGR",
++		sizeof(fd->description));
++	return 0;
++}
++
++static void cam_fill_fmt(struct v4l2_pix_format *p)
++{
++	p->width = CAM_H_RES;
++	p->height = CAM_V_RES;
++	p->pixelformat = V4L2_PIX_FMT_SBGGR8;
++	p->field = V4L2_FIELD_NONE;
++	p->bytesperline = CAM_H_RES;
++	p->sizeimage = CAM_FRAME_BYTES;
++	p->colorspace = V4L2_COLORSPACE_RAW;
++}
++
++/* One sensor, one mode: g/s/try all report the same fixed format. */
++static int cam_g_fmt(struct file *f, void *priv, struct v4l2_format *fmt)
++{
++	if (fmt->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
++		return -EINVAL;
++	cam_fill_fmt(&fmt->fmt.pix);
++	return 0;
++}
++
++static int cam_enum_framesizes(struct file *f, void *priv,
++			       struct v4l2_frmsizeenum *fs)
++{
++	if (fs->index || fs->pixel_format != V4L2_PIX_FMT_SBGGR8)
++		return -EINVAL;
++	fs->type = V4L2_FRMSIZE_TYPE_DISCRETE;
++	fs->discrete.width = CAM_H_RES;
++	fs->discrete.height = CAM_V_RES;
++	return 0;
++}
++
++static int cam_enum_input(struct file *f, void *priv,
++			  struct v4l2_input *in)
++{
++	if (in->index)
++		return -EINVAL;
++	in->type = V4L2_INPUT_TYPE_CAMERA;
++	in->std = V4L2_STD_UNKNOWN;
++	strscpy(in->name, "CSI-2", sizeof(in->name));
++	return 0;
++}
++
++static int cam_g_input(struct file *f, void *priv, unsigned int *i)
++{
++	*i = 0;
++	return 0;
++}
++
++static int cam_s_input(struct file *f, void *priv, unsigned int i)
++{
++	return i ? -EINVAL : 0;
++}
++
++static const struct v4l2_ioctl_ops cam_v4l2_ioctl_ops = {
++	.vidioc_querycap = cam_querycap,
++	.vidioc_enum_fmt_vid_cap = cam_enum_fmt,
++	.vidioc_g_fmt_vid_cap = cam_g_fmt,
++	.vidioc_s_fmt_vid_cap = cam_g_fmt,
++	.vidioc_try_fmt_vid_cap = cam_g_fmt,
++	.vidioc_enum_framesizes = cam_enum_framesizes,
++	.vidioc_enum_input = cam_enum_input,
++	.vidioc_g_input = cam_g_input,
++	.vidioc_s_input = cam_s_input,
++};
++
++static const struct v4l2_file_operations cam_v4l2_fops = {
++	.owner = THIS_MODULE,
++	.open = cam_v4l2_open,
++	.release = cam_v4l2_release,
++	.read = cam_v4l2_read,
++	.unlocked_ioctl = video_ioctl2,
++};
++
++static int cam_v4l2_register(struct esp32p4_cam *c)
++{
++	int ret;
++
++	ret = v4l2_device_register(c->dev, &c->v4l2_dev);
++	if (ret)
++		return ret;
++	c->vdev.v4l2_dev = &c->v4l2_dev;
++	c->vdev.fops = &cam_v4l2_fops;
++	c->vdev.ioctl_ops = &cam_v4l2_ioctl_ops;
++	c->vdev.release = video_device_release_empty;
++	c->vdev.vfl_dir = VFL_DIR_RX;
++	c->vdev.lock = &c->lock;
++	c->vdev.device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_READWRITE;
++	strscpy(c->vdev.name, "esp32p4-cam", sizeof(c->vdev.name));
++	video_set_drvdata(&c->vdev, c);
++	ret = video_register_device(&c->vdev, VFL_TYPE_VIDEO, -1);
++	if (ret) {
++		v4l2_device_unregister(&c->v4l2_dev);
++		return ret;
++	}
++	return 0;
++}
++#endif
++
+ static int esp32p4_cam_probe(struct platform_device *pdev)
+ {
+ 	struct esp32p4_cam *c;
+ 	struct device_node *scan;
+ 	u32 v;
++	int ret;
+ 
+ 	struct resource *res;
+ 
+@@ -618,7 +835,25 @@
+ 	c->misc.name = "cam0";
+ 	c->misc.fops = &cam_fops;
+ 	platform_set_drvdata(pdev, c);
+-	return misc_register(&c->misc);
++	mutex_init(&c->lock);
++	ret = misc_register(&c->misc);
++	if (ret)
++		goto err_fb;
++#if IS_ENABLED(CONFIG_VIDEO_DEV)
++	ret = cam_v4l2_register(c);
++	if (ret)
++		goto err_misc;
++#endif
++	return 0;
++
++#if IS_ENABLED(CONFIG_VIDEO_DEV)
++err_misc:
++	misc_deregister(&c->misc);
++#endif
++err_fb:
++	dma_free_coherent(&pdev->dev, CAM_FRAME_BYTES, c->fb_va,
++			  c->fb_pa);
++	return ret;
+ }
+ 
+ static void esp32p4_cam_remove(struct platform_device *pdev)
+@@ -628,6 +863,10 @@
+ 	writel(0, c->brg + BRG_CSI_EN);
+ 	writel(GDMA_CHEN_DIS(c->chan), c->gdma + GDMA_CHEN0);
+ 	gpiod_set_value_cansleep(c->rst, 0);	/* never leave CAM_RST high */
++#if IS_ENABLED(CONFIG_VIDEO_DEV)
++	video_unregister_device(&c->vdev);
++	v4l2_device_unregister(&c->v4l2_dev);
++#endif
+ 	misc_deregister(&c->misc);
+ 	if (c->fb_va)
+ 		dma_free_coherent(&pdev->dev, CAM_FRAME_BYTES, c->fb_va,

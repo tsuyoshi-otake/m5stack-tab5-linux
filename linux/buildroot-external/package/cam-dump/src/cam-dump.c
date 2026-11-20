@@ -327,7 +327,7 @@ int main(int argc, char **argv)
 {
 	const char *out = NULL;
 	int frames = 1, pattern = 0, i2c = -1, ofd = -1, rc = 1;
-	int pause_ms = 0, ppm = 0, wb = 1, ae = 0;
+	int pause_ms = 0, ppm = 0, wb = 1, ae = 0, setup = 0;
 	int exp_val = -1, gain_val = -1;
 	int caps, exp_cur, gain_cur;
 	unsigned exp_a = 0, gain_a = 0;
@@ -362,13 +362,15 @@ int main(int argc, char **argv)
 		}
 		else if (!strcmp(argv[i], "-a"))
 			ae = 1;
+		else if (!strcmp(argv[i], "-S"))
+			setup = 1;
 		else if (!strcmp(argv[i], "-p"))
 			pattern = 1;
 		else if (!strcmp(argv[i], "-W"))
 			wb = 0;
 		else {
 			fprintf(stderr,
-				"usage: cam-dump [-o out|-] [-f raw|ppm] [-n frames] [-p] [-P pause_ms] [-W] [-a] [-e val] [-g idx]\n");
+				"usage: cam-dump [-o out|-] [-f raw|ppm] [-n frames] [-p] [-P pause_ms] [-W] [-a] [-e val] [-g idx] [-S]\n");
 			return 2;
 		}
 	}
@@ -405,6 +407,28 @@ int main(int argc, char **argv)
 	if (ioctl(i2c, I2C_SLAVE, SENSOR_ADDR) < 0) {
 		perror("I2C_SLAVE");
 		return 1;
+	}
+	/* -S: sensor init over SCCB + PREPARE, then hold /dev/cam0
+	 * open so the rail stays up for /dev/video0 readers (the
+	 * kernel keeps no sensor state; the last close of either node
+	 * powers the camera down). */
+	if (setup) {
+		int cam = open("/dev/cam0", O_RDONLY);
+
+		if (cam < 0) {
+			perror("open /dev/cam0");
+			goto out;
+		}
+		if (ioctl(cam, CAM_IOC_PREPARE, 0) < 0) {
+			perror("CAM_PREPARE");
+			goto out;
+		}
+		if (sensor_setup(i2c, pattern, exp_val, gain_val))
+			goto out;
+		fprintf(stderr,
+			"cam-dump: sensor ready; holding cam0 for /dev/video0 (Ctrl-C to release)\n");
+		for (;;)
+			pause();
 	}
 	if (!strcmp(out, "-"))
 		ofd = STDOUT_FILENO;

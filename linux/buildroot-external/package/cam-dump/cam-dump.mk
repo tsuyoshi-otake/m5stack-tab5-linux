@@ -15,11 +15,16 @@ define CAM_DUMP_BUILD_CMDS
 		-Wl,-elf2flt=-s16384 \
 		-o $(@D)/cam-dump $(@D)/cam-dump.c $(@D)/bggr-ppm.c \
 		$(@D)/cam-ae.c
+	$(TARGET_CC) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) \
+		-Wl,-elf2flt=-s16384 \
+		-o $(@D)/v4l2-probe $(@D)/v4l2-probe.c
 endef
 
 define CAM_DUMP_INSTALL_TARGET_CMDS
 	$(INSTALL) -D -m 0755 $(@D)/cam-dump \
 		$(TARGET_DIR)/usr/bin/cam-dump
+	$(INSTALL) -D -m 0755 $(@D)/v4l2-probe \
+		$(TARGET_DIR)/usr/bin/v4l2-probe
 endef
 
 $(eval $(generic-package))

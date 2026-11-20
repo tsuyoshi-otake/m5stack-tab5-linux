@@ -402,3 +402,35 @@ vendor driver's order (shutter then gain — it uses no group hold
 either).  Nothing is added to memory: `-a` reuses the one frame
 buffer every iteration, and means come from the same pass `stats()`
 already does.
+
+## `/dev/video0` — the same camera through V4L2 (#44, patch 0141)
+
+`esp32p4_cam` also registers a `video_device`, so generic V4L2
+readers see the camera as `/dev/video0`.  It is deliberately the
+smallest honest V4L2 node: `V4L2_CAP_VIDEO_CAPTURE | READWRITE`
+(read() only — `STREAMING` would need a videobuf2 queue or a second
+frame buffer, which the ~2 MB headroom cannot pay for), one fixed
+format `SBGGR8 1280x720` (bytesperline 1280, sizeimage 921600), one
+input, and the ioctls `QUERYCAP / ENUM_FMT / G,S,TRY_FMT /
+ENUM_FRAMESIZES / ENUM,G,S_INPUT`.
+
+The kernel still keeps **no sensor state**: the SC202CS init table
+lives in user space exactly as before.  The rail is powered only
+while a node is open (`opens` counts both `cam0` and `video0`), so
+the flow for a plain V4L2 read is:
+
+    cam-dump -S &        # sensor init + PREPARE, holds cam0 open
+    sleep 1
+    cat /dev/video0 > frame.raw        # or: v4l2-probe /dev/video0 out.raw
+    kill %cam-dump                     # last close powers the camera down
+
+`v4l2-probe` (built next to cam-dump, ~8 KB) is the tiny check tool
+the rootfs ships instead of v4l-utils: it prints QUERYCAP, the
+enumerated format, G_FMT, then reads one frame and reports its size
+and mean.  `v4l-utils`/`v4l2-ctl` was measured and rejected — it
+pulls C++, libstdcpp and a dozen tools into a squashfs that has no
+spare half-megabyte.
+
+`camera=off` still costs only the V4L2 core objects: S08camera
+unbinds the platform device and `esp32p4_cam_remove` unregisters
+the video device and frees the frame buffer.
