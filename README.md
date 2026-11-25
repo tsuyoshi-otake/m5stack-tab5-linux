@@ -14,7 +14,7 @@ This repository is the Tab5 port of [m5stamp-p4-c6-linux](https://github.com/tsu
 
 ## Status
 
-Checked on a Tab5 (ESP32-P4 rev v1.3, ST7121 panel). The checks for the v0.7.0 release are in [`linux/tests/v0.7.0-hardware-validation-2026-11-25.md`](linux/tests/v0.7.0-hardware-validation-2026-11-25.md) (v0.6.0: [`v0.6.0-hardware-validation-2026-11-15.md`](linux/tests/v0.6.0-hardware-validation-2026-11-15.md)). Hardware that is not supported yet is listed in #38. Each row names the issue where the result is recorded:
+Checked on a Tab5 (ESP32-P4 rev v1.3, ST7121 panel). The checks for the v0.7.1 release are in [`linux/tests/v0.7.1-hardware-validation-2026-11-25.md`](linux/tests/v0.7.1-hardware-validation-2026-11-25.md) (v0.7.0: [`v0.7.0-hardware-validation-2026-11-25.md`](linux/tests/v0.7.0-hardware-validation-2026-11-25.md), v0.6.0: [`v0.6.0-hardware-validation-2026-11-15.md`](linux/tests/v0.6.0-hardware-validation-2026-11-15.md)). Hardware that is not supported yet is listed in #38. Each row names the issue where the result is recorded:
 
 | Area | Result |
 | :--- | :--- |
@@ -104,8 +104,8 @@ The release does not carry C6 binaries. The path used during bring-up (#1) updat
 
 Download the release package from [Releases](https://github.com/tsuyoshi-otake/m5stack-tab5-linux/releases):
 
-- **`m5stack-tab5-linux-smp-v0.7.0.zip`**: the partition binaries and `flash-candidate.ps1`.
-- **`m5stack-tab5-linux-smp-v0.7.0-16mb.bin.gz`**: the same as one 16 MiB image.
+- **`m5stack-tab5-linux-smp-v0.7.1.zip`**: the partition binaries and `flash-candidate.ps1`.
+- **`m5stack-tab5-linux-smp-v0.7.1-16mb.bin.gz`**: the same as one 16 MiB image.
 
 #### Option A: PowerShell script (recommended)
 
@@ -142,8 +142,8 @@ esptool.py --chip esp32p4 --port COM13 --baud 460800 \
 #### Option C: one 16 MiB image
 
 ```bash
-gzip -d m5stack-tab5-linux-smp-v0.7.0-16mb.bin.gz
-esptool.py --chip esp32p4 --port COM13 --baud 460800 write_flash 0x0 m5stack-tab5-linux-smp-v0.7.0-16mb.bin
+gzip -d m5stack-tab5-linux-smp-v0.7.1-16mb.bin.gz
+esptool.py --chip esp32p4 --port COM13 --baud 460800 write_flash 0x0 m5stack-tab5-linux-smp-v0.7.1-16mb.bin
 ```
 
 This overwrites the whole flash, including the stock NVS and PHY data and any credentials from an earlier install.
@@ -306,7 +306,7 @@ ES_BOARD=tab5 bash linux/release-build.sh --vendor /path/to/out --profile m3-lab
 
 `release-build.sh` is the same wrapper the release workflow calls; it sets the three `NOMMU_*` variables that are the release settings of the user-pool allocator, then runs `linux/build-c68.sh`. This compiles the boot shim, the Linux 7.2 SMP kernel with the Tab5 device tree and patches, and the Buildroot root filesystem with BusyBox, Dropbear, MicroPython and the ESP-Hosted-NG driver. Without `ES_BOARD=tab5` the build is for the Stamp-P4.
 
-`linux/tools/package-release.py --board tab5 --build-output /path/to/out --boot-image /path/to/out/buildroot/images/boot.img --output release --version v0.7.0` makes the release files.
+`linux/tools/package-release.py --board tab5 --build-output /path/to/out --boot-image /path/to/out/buildroot/images/boot.img --output release --version v0.7.1` makes the release files.
 
 ---
 
