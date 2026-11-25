@@ -86,6 +86,10 @@ export M5CFG_BLE_BONDS="$tmp/ble-bonds.dat"
 # attribute back when it finds one.  The text_color tests point this
 # at a file of their own.
 export M5CFG_FBCON_ROTATE="$tmp/no-fbcon-rotate"
+# Never the host's own VT palette defaults either (textcolor_vtdefaults
+# writes /sys/module/vt/parameters as root); the text_color tests use a
+# directory of their own.
+export M5CFG_VT_PARAMS="$tmp/no-vt-params"
 
 fails=0
 ok() { echo "ok: $1"; }
@@ -1956,6 +1960,67 @@ out=$(TEXTCOLOR_FBROT="$tmp/tc-rot"; textcolor_redraw)
 [ "$out" = "$_dec" ] && [ "$(cat "$tmp/tc-rot")" = junk ] &&
 	ok "redraw leaves a value that is no rotation alone" ||
 	bad "redraw junk: $(cat "$tmp/tc-rot")"
+# textcolor_vtdefaults: the kernel's VT palette defaults (ESC ] R and a
+# new VT load them; the boot shim sets them from config.txt).  A fake
+# /sys/module/vt/parameters with the stock values, as the kernel reads
+# them back: comma-separated decimal.
+_vtr=0,170,0,170,0,170,0,170,85,255,85,255,85,255,85,255
+_vtg=0,0,170,85,0,0,170,170,85,85,255,255,85,85,255,255
+_vtb=0,0,0,0,170,170,170,170,85,85,85,85,255,255,255,255
+vt_stock() {
+	mkdir -p "$tmp/vtp"
+	echo "$_vtr" > "$tmp/vtp/default_red"
+	echo "$_vtg" > "$tmp/vtp/default_grn"
+	echo "$_vtb" > "$tmp/vtp/default_blu"
+}
+vt_is() { # red grn blu
+	[ "$(cat "$tmp/vtp/default_red")" = "$1" ] &&
+		[ "$(cat "$tmp/vtp/default_grn")" = "$2" ] &&
+		[ "$(cat "$tmp/vtp/default_blu")" = "$3" ]
+}
+# amber: normal d67200 (214,114,0), bright ff941a (255,148,26), dim
+# 733d00 (115,61,0), black background.
+_var=0,214,214,214,214,214,214,214,115,255,255,255,255,255,255,255
+_vag=0,114,114,114,114,114,114,114,61,148,148,148,148,148,148,148
+_vab=0,0,0,0,0,0,0,0,0,26,26,26,26,26,26,26
+vt_stock
+TEXTCOLOR_VTPARAMS="$tmp/vtp"
+textcolor_vtdefaults amber
+vt_is "$_var" "$_vag" "$_vab" && [ "$TC_VT_CHANGED" = 1 ] &&
+	ok "vtdefaults amber: slot 0 bg, 1-7 normal, 8 dim, 9-15 bright" ||
+	bad "vtdefaults amber: $(cat "$tmp/vtp/default_red") changed=$TC_VT_CHANGED"
+textcolor_vtdefaults amber
+vt_is "$_var" "$_vag" "$_vab" && [ -z "$TC_VT_CHANGED" ] &&
+	ok "vtdefaults: the same preset again changes nothing" ||
+	bad "vtdefaults amber again: changed=$TC_VT_CHANGED"
+textcolor_vtdefaults lcd
+[ "$(cat "$tmp/vtp/default_red")" = 78,17,17,17,17,17,17,17,45,9,9,9,9,9,9,9 ] &&
+	[ "$TC_VT_CHANGED" = 1 ] &&
+	ok "vtdefaults lcd: the lit background in slot 0" ||
+	bad "vtdefaults lcd: $(cat "$tmp/vtp/default_red")"
+for n in white "" nosuch; do
+	textcolor_vtdefaults amber
+	textcolor_vtdefaults "$n"
+	vt_is "$_vtr" "$_vtg" "$_vtb" && [ "$TC_VT_CHANGED" = 1 ] &&
+		ok "vtdefaults '$n': the stock palette" ||
+		bad "vtdefaults '$n': $(cat "$tmp/vtp/default_red")"
+done
+chmod a-w "$tmp/vtp/default_grn"
+if [ -w "$tmp/vtp/default_grn" ]; then
+	echo "skip: vtdefaults not-writable case (the file stays writable here)"
+else
+	textcolor_vtdefaults amber
+	vt_is "$_vtr" "$_vtg" "$_vtb" && [ -z "$TC_VT_CHANGED" ] &&
+		ok "vtdefaults: a parameter it cannot write leaves all three" ||
+		bad "vtdefaults read-only: $(cat "$tmp/vtp/default_red")"
+fi
+chmod u+w "$tmp/vtp/default_grn"
+TEXTCOLOR_VTPARAMS="$tmp/no-such-vtp"
+textcolor_vtdefaults amber; rc=$?
+TEXTCOLOR_VTPARAMS="$M5CFG_VT_PARAMS"
+[ "$rc" -eq 0 ] && [ -z "$TC_VT_CHANGED" ] && [ ! -e "$tmp/no-such-vtp" ] &&
+	ok "vtdefaults without the parameters: a quiet no-op" ||
+	bad "vtdefaults no params rc=$rc"
 
 # (b) the managed key: set/get/list round trip through drive_write,
 # an unknown colour rejected with the name list, "" deletes, and the
@@ -2109,6 +2174,48 @@ M5CFG_CONFIG_TXT="$tmp/s07tc/config.txt" M5CFG_TEXTCOLOR_TTY="$tmp/tctty" \
 cmp -s "$tmp/tctty" "$tmp/tc-want-reset" &&
 	ok "apply without the lib resets to white + toggles" ||
 	bad "s07tc nolib: $(od -c "$tmp/tctty" | head -3)"
+# The kernel's palette defaults move with the colour.  s07vt CMD runs
+# S07textcolor against the fake parameters in $tmp/vtp.
+s07vt() {
+	: > "$tmp/tctty"
+	M5CFG_CONFIG_TXT="$tmp/s07tc/config.txt" M5CFG_TEXTCOLOR_TTY="$tmp/tctty" \
+		M5CFG_TEXTCOLOR_LIB="$TCLIB" M5CFG_RUN_DIR="$tmp/tcrun" \
+		M5CFG_PROC="$tmp/tcproc" M5CFG_VT_PARAMS="$tmp/vtp" \
+		sh "$S07TC" "$1"
+}
+vt_stock
+printf 'text_color=amber\n' > "$tmp/s07tc/config.txt"
+s07vt start
+vt_is "$_var" "$_vag" "$_vab" && cmp -s "$tmp/tctty" "$tmp/tc-want-apply" &&
+	ok "start: amber defaults (a shim that did not) + the palette" ||
+	bad "s07vt start amber: $(cat "$tmp/vtp/default_red")"
+s07vt start
+vt_is "$_var" "$_vag" "$_vab" && cmp -s "$tmp/tctty" "$tmp/tc-want-apply" &&
+	ok "start: amber defaults already set (the shim did) + the palette" ||
+	bad "s07vt start amber again: $(od -c "$tmp/tctty" | head -2)"
+printf 'text_color=white\n' > "$tmp/s07tc/config.txt"
+s07vt start
+vt_is "$_vtr" "$_vtg" "$_vtb" && cmp -s "$tmp/tctty" "$tmp/tc-want-reset" &&
+	ok "start: white with amber defaults puts stock back, then ESC ] R" ||
+	bad "s07vt start white: $(cat "$tmp/vtp/default_red") $(od -c "$tmp/tctty" | head -2)"
+s07vt start
+vt_is "$_vtr" "$_vtg" "$_vtb" && [ ! -s "$tmp/tctty" ] &&
+	ok "start: white with stock defaults writes nothing" ||
+	bad "s07vt start white stock: $(od -c "$tmp/tctty" | head -2)"
+printf 'text_color=amber\n' > "$tmp/s07tc/config.txt"
+s07vt apply
+printf 'hostname=x\n' > "$tmp/s07tc/config.txt"
+s07vt apply
+vt_is "$_vtr" "$_vtg" "$_vtb" && cmp -s "$tmp/tctty" "$tmp/tc-want-reset" &&
+	ok "apply: amber -> no key puts the stock defaults back before ESC ] R" ||
+	bad "s07vt apply reset: $(cat "$tmp/vtp/default_red")"
+printf 'text_color=amber\n' > "$tmp/s07tc/config.txt"
+: > "$tmp/tcrun/.m5cfg-ev.$$"; mkdir -p "$tmp/tcproc/$$"
+s07vt apply
+vt_is "$_vtr" "$_vtg" "$_vtb" && [ ! -s "$tmp/tctty" ] &&
+	ok "apply under a live menu leaves the defaults to the menu" ||
+	bad "s07vt apply menu: $(cat "$tmp/vtp/default_red")"
+rm -f "$tmp/tcrun/.m5cfg-ev.$$"; rmdir "$tmp/tcproc/$$"
 
 # (d) the menu, touch mode.  With backlight + presets the Display
 # screen is the two-item submenu; amber = tpick slot 2.  The session
@@ -2248,8 +2355,14 @@ stop_saver
 imgfile config.txt > "$tmp/pub/config.txt"
 printf 'T 8 50\nT 4 50\nT 4 10\nT 20 10\nT 20 10\nT 20 10\n' \
 	> "$tmp/tscr/events"
+# Booted under lcd: the kernel's palette defaults are lcd, so the exit's
+# ESC ] R is only white once they are put back to stock.
+TEXTCOLOR_VTPARAMS="$tmp/vtp"
+textcolor_vtdefaults lcd
+TEXTCOLOR_VTPARAMS="$M5CFG_VT_PARAMS"
 start_saver
 out=$(M5CFG_BLDIR="$tmp/bl" M5CFG_TEXTCOLOR_LIB="$TCLIB" \
+	M5CFG_VT_PARAMS="$tmp/vtp" \
 	M5CFG_TSCRIPT="$tmp/tscr/events" sh "$tool" menu </dev/null 2>&1)
 stop_saver
 imgfile config.txt | grep -q '^text_color=white' &&
@@ -2258,6 +2371,9 @@ imgfile config.txt | grep -q '^text_color=white' &&
 	case "$out" in *"e5e9f0$_clr$_dec"*"$escB"*) true ;; *) false ;; esac &&
 	ok "lcd -> white: back to the Nord menu, margin repainted both ways" ||
 	bad "lcd to white: $(imgfile config.txt | grep text_color) $(printf '%s' "$out" | tail -c 300 | od -c | head -8)"
+vt_is "$_vtr" "$_vtg" "$_vtb" &&
+	ok "lcd -> white: the exit puts the kernel's defaults back to stock" ||
+	bad "lcd to white defaults: $(cat "$tmp/vtp/default_red")"
 start_saver
 M5CFG_TEXTCOLOR_LIB="$TCLIB" sh "$tool" set text_color "" >/dev/null 2>&1
 stop_saver

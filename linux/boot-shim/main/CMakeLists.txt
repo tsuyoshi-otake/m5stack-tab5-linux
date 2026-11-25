@@ -30,7 +30,8 @@ endif()
 # tied to UP_BOOT.
 if("$ENV{ES_BOARD}" STREQUAL "tab5")
     target_compile_definitions(${COMPONENT_LIB} PRIVATE BOARD_TAB5=1)
-    target_sources(${COMPONENT_LIB} PRIVATE "tab5_board.c" "tab5_display.c")
+    target_sources(${COMPONENT_LIB} PRIVATE "tab5_board.c" "tab5_display.c"
+        "tab5_textcolor.c")
 endif()
 if("$ENV{C68_CLEAN_RELEASE}" STREQUAL "1")
     target_compile_definitions(${COMPONENT_LIB} PRIVATE C68_CLEAN_RELEASE=1)

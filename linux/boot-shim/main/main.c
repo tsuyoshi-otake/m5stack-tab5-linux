@@ -71,6 +71,7 @@
 #ifdef BOARD_TAB5
 #include "tab5_board.h"
 #include "tab5_display.h"
+#include "tab5_textcolor.h"
 #endif
 
 #include "hal/usb_wrap_ll.h"
@@ -621,6 +622,34 @@ static bool patch_panel_name(uint8_t *dtb, uint32_t total)
 	}
 	return false;
 }
+
+/* The panel console in text_color= from the first kernel line: the preset
+ * named in config.txt of the boot slot just loaded goes into the kernel's
+ * VT palette defaults, the vt.default_red/_grn/_blu= placeholder in the
+ * bootargs (tab5_textcolor.c).  Without it the boot log is grey on black
+ * until S07textcolor repaints.  White, a missing key or an unknown name
+ * leave the stock values. */
+static void patch_text_color(uint8_t *dtb, uint32_t total, bool boot_loaded)
+{
+	char name[TAB5_TC_NAME_MAX];
+	uint8_t rgb[16][3];
+	int found;
+
+	if (!boot_loaded)
+		return;
+	found = tab5_textcolor_from_fat((const uint8_t *)(uintptr_t)BOOT_LOAD_PA,
+					BOOT_IMAGE_BYTES, name, sizeof(name));
+	if (found < 0) {
+		ESP_LOGW(TAG, "text_color: boot slot is not a FAT12 volume; stock console colours");
+		return;
+	}
+	if (!found || !tab5_textcolor_palette(name, rgb))
+		return;
+	if (tab5_textcolor_patch_bootargs(dtb, total, rgb))
+		ESP_LOGI(TAG, "text_color=%s: console palette in the bootargs", name);
+	else
+		ESP_LOGW(TAG, "text_color=%s: vt.default_* missing from the DTB bootargs", name);
+}
 #endif /* BOARD_TAB5 */
 
 /* #43: hand the boot-slot verdict to Linux.  /chosen/m5stack,bootfat in
@@ -1004,8 +1033,10 @@ void app_main(void)
 		fatal_restart("DTB copy failed");
 
 	const esp_partition_t *boot_part = select_boot_partition();
+	bool boot_loaded = false;
 	if (boot_part) {
 		if (load_partition(boot_part, BOOT_LOAD_PA, BOOT_IMAGE_BYTES) == ESP_OK) {
+			boot_loaded = true;
 			/* The selected, CRC-validated flash slot is authoritative. */
 			ESP_LOGI(TAG, "boot slot loaded from flash to PSRAM 0x%08x (%u bytes; flash is authoritative)",
 				 BOOT_LOAD_PA, BOOT_IMAGE_BYTES);
@@ -1049,9 +1080,12 @@ void app_main(void)
 		ESP_LOGW(TAG, "gt911 DTB patch failed; touch stays disabled");
 	if (!patch_panel_name(dtb, total))
 		ESP_LOGW(TAG, "panel-name DTB patch failed; Linux sees nopanel0");
+	patch_text_color(dtb, total, boot_loaded);
 	if (s_tab5_fb.ok)
 		tab5_display_status();
 	tab5_i2c_release();
+#else
+	(void)boot_loaded;
 #endif
 	/* Old DTBs lack the placeholder; the kernel then falls back to the
 	 * FAT signature check like before. */

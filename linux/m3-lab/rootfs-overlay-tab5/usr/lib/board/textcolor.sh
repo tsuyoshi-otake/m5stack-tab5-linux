@@ -12,6 +12,11 @@
 # ANSI colour maps to the one hue.  The background is black, except
 # for 'lcd': dark ink on a lit background, the reflective LCD of an
 # old handheld.  'white' is the stock 16-colour palette (ESC ] R).
+#
+# The boot shim reads text_color= too (tab5_textcolor.c in the boot
+# shim, which carries a copy of the preset table below): it puts the
+# preset into the kernel's VT palette defaults through the bootargs,
+# so the console is in its colour from the first kernel line.
 
 TEXTCOLOR_NAMES="white green amber orange cyan blue pink red lcd"
 
@@ -19,7 +24,13 @@ TEXTCOLOR_NAMES="white green amber orange cyan blue pink red lcd"
 # to it.
 TEXTCOLOR_FBROT=${M5CFG_FBCON_ROTATE:-/sys/class/graphics/fbcon/rotate}
 
-# _tc_mono NORMAL BRIGHT DIM [BACKGROUND] -> TC_SEQ, TC_HEX, TC_BG.
+# The kernel's VT palette defaults (vt.default_red/_grn/_blu): what
+# ESC ] R and every newly opened VT load.  textcolor_vtdefaults
+# writes them.
+TEXTCOLOR_VTPARAMS=${M5CFG_VT_PARAMS:-/sys/module/vt/parameters}
+
+# _tc_mono NORMAL BRIGHT DIM [BACKGROUND] -> TC_SEQ, TC_HEX, TC_BG
+# (and TC_BRT, TC_DIM for textcolor_vtdefaults).
 # TC_SEQ is printf FORMAT text (the \033 below stays the four
 # characters backslash-0-3-3 until the caller's printf "$TC_SEQ"
 # turns it into the ESC byte); TC_HEX is the normal colour rrggbb and
@@ -28,6 +39,8 @@ TEXTCOLOR_FBROT=${M5CFG_FBCON_ROTATE:-/sys/class/graphics/fbcon/rotate}
 # m5-config's _pal_set writes.
 _tc_mono() {
 	TC_HEX=$1
+	TC_BRT=$2
+	TC_DIM=$3
 	TC_BG=${4:-000000}
 	TC_SEQ="\033]P0$TC_BG"
 	_i=1
@@ -69,6 +82,66 @@ textcolor_seq() {
 		white)	TC_SEQ='\033]R'; TC_HEX=aaaaaa; TC_BG=000000 ;;
 		*)	return 1 ;;
 	esac
+	return 0
+}
+
+# textcolor_vtdefaults NAME: point the kernel's VT palette defaults at
+# preset NAME -- the stock palette for white, an empty or an unknown
+# name.  Boot set them to the preset config.txt named then, so a
+# change of text_color has to move them before an ESC ] R, or the
+# reset would bring the boot colour back.  TC_VT_CHANGED is 1 when a
+# value changed, empty when none did or the parameters are not there
+# or not writable (not root).  Overwrites TC_SEQ, TC_HEX and TC_BG:
+# call it before textcolor_seq.
+textcolor_vtdefaults() {
+	TC_VT_CHANGED=""
+	_tcv_d=$TEXTCOLOR_VTPARAMS
+	[ -w "$_tcv_d/default_red" ] && [ -w "$_tcv_d/default_grn" ] &&
+		[ -w "$_tcv_d/default_blu" ] || return 0
+	if [ -n "$1" ] && [ "$1" != white ] &&
+		textcolor_seq "$1" 2>/dev/null; then
+		_tcv_rgb "$TC_BG"
+		_tcv_r=$_tcv_1; _tcv_g=$_tcv_2; _tcv_b=$_tcv_3
+		_tcv_rgb "$TC_HEX"
+		_tcv_add 7
+		_tcv_rgb "$TC_DIM"
+		_tcv_add 1
+		_tcv_rgb "$TC_BRT"
+		_tcv_add 7
+	else
+		_tcv_r=0,170,0,170,0,170,0,170,85,255,85,255,85,255,85,255
+		_tcv_g=0,0,170,85,0,0,170,170,85,85,255,255,85,85,255,255
+		_tcv_b=0,0,0,0,170,170,170,170,85,85,85,85,255,255,255,255
+	fi
+	_tcv_put default_red "$_tcv_r"
+	_tcv_put default_grn "$_tcv_g"
+	_tcv_put default_blu "$_tcv_b"
+	return 0
+}
+# _tcv_rgb RRGGBB -> _tcv_1 _tcv_2 _tcv_3, decimal.
+_tcv_rgb() {
+	_tcv_1=$((0x${1%????}))
+	_tcv_2=${1#??}
+	_tcv_2=$((0x${_tcv_2%??}))
+	_tcv_3=$((0x${1#????}))
+}
+# _tcv_add N: append _tcv_1/2/3 N times to the three lists.
+_tcv_add() {
+	_tcv_n=$1
+	while [ "$_tcv_n" -gt 0 ]; do
+		_tcv_r="$_tcv_r,$_tcv_1"
+		_tcv_g="$_tcv_g,$_tcv_2"
+		_tcv_b="$_tcv_b,$_tcv_3"
+		_tcv_n=$((_tcv_n - 1))
+	done
+}
+# _tcv_put PARAM LIST: write the list unless the kernel already has
+# it (the read-back is the same comma-separated decimal form).
+_tcv_put() {
+	_tcv_o=""
+	read -r _tcv_o 2>/dev/null < "$_tcv_d/$1"
+	[ "$_tcv_o" = "$2" ] && return 0
+	echo "$2" 2>/dev/null > "$_tcv_d/$1" && TC_VT_CHANGED=1
 	return 0
 }
 

@@ -84,8 +84,13 @@
 		 * dock holds the panel in landscape, so an 80 x 22 cell
 		 * console reads upright (the ST712x MADCTL only mirrors; the
 		 * 90 deg turn has to be done in fbcon, the panel cannot).
+		 * vt.default_red/_grn/_blu= are the kernel's own stock VT
+		 * palette, written out in a fixed width: the boot shim
+		 * overwrites the values in place with the text_color= preset
+		 * of config.txt, so the console has its colour from the first
+		 * line (tab5_textcolor.c).  Keep the "0xNN" x 16 form.
 		 */
-		bootargs = "earlycon=esp32p4usbjtag,mmio32,0x500d2000 console=tty0 console=ttyGS1,115200n8 loglevel=7 consoleblank=0 fbcon=font:TER16x32 fbcon=rotate:3 root=/dev/mtdblock0 rootfstype=squashfs ro init=/sbin/init maxcpus=1";
+		bootargs = "earlycon=esp32p4usbjtag,mmio32,0x500d2000 console=tty0 console=ttyGS1,115200n8 loglevel=7 consoleblank=0 fbcon=font:TER16x32 fbcon=rotate:3 root=/dev/mtdblock0 rootfstype=squashfs ro init=/sbin/init maxcpus=1 vt.default_red=0x00,0xaa,0x00,0xaa,0x00,0xaa,0x00,0xaa,0x55,0xff,0x55,0xff,0x55,0xff,0x55,0xff vt.default_grn=0x00,0x00,0xaa,0x55,0x00,0x00,0xaa,0xaa,0x55,0x55,0xff,0xff,0x55,0x55,0xff,0xff vt.default_blu=0x00,0x00,0x00,0x00,0xaa,0xaa,0xaa,0xaa,0x55,0x55,0x55,0x55,0xff,0xff,0xff,0xff";
 		/*
 		 * Filled in by the boot shim's tab5_detect_panel() before the
 		 * Linux jump (fixed 8-byte field, patched in place):

@@ -6,10 +6,13 @@
 # two-intensity monochrome display (slot 0 the background -- black,
 # or the lit background of 'lcd' --, 1-7 the colour, 8 a dim shade,
 # 9-F the bold colour); 'white' or a missing key is the stock 16
-# colours, so 'start' only writes a real preset (boot already has
-# stock).  Written to the panel tty only -- serial/SSH terminals
-# never see it.  Builtins only except one printf for the CR byte:
-# no $( ) storm on NOMMU.
+# colours.  The boot shim has already put the preset into the
+# kernel's VT palette defaults (vt.default_* in the bootargs), so the
+# panel shows it from the first kernel line; 'start' writes a real
+# preset once more for a shim that could not, and 'apply' moves the
+# defaults along with the palette (ESC ] R loads them).  Written to
+# the panel tty only -- serial/SSH terminals never see it.  Builtins
+# only except one printf for the CR byte: no $( ) storm on NOMMU.
 #
 # Text that is already on the screen keeps its old colours on this
 # truecolor framebuffer, and so does the margin below the last text
@@ -65,16 +68,27 @@ case "$1" in
 			[ -e "$PROCDIR/${_f##*/.m5cfg-ev.}" ] && exit 0
 		done
 	fi
-	TC_SEQ=""; TC_HEX=""
-	# The lib brings the real repaint; without it a reset still
-	# gets the plain DECSCNM pair.
+	TC_SEQ=""; TC_HEX=""; TC_VT_CHANGED=""
+	# The lib brings the real repaint and the palette defaults;
+	# without it a reset still gets the plain DECSCNM pair.
 	textcolor_redraw() { printf '\033[?5h\033[?5l'; }
+	textcolor_vtdefaults() { :; }
 	[ -r "$LIB" ] && . "$LIB"
+	# First: an ESC ] R below loads these.
+	textcolor_vtdefaults "$name"
 	if [ "$1" = start ]; then
-		# Boot: the stock palette is already up, so nothing is
-		# written for a missing key, 'white' or a bad name.
-		[ -n "$name" ] && [ "$name" != white ] || exit 0
-		textcolor_seq "$name" 2>/dev/null || exit 0
+		# Boot: the shim's palette is up.  A missing key, 'white'
+		# or a bad name writes nothing -- unless the defaults had
+		# to go back to stock just now (the shim read another
+		# colour), then ESC ] R loads them.
+		if [ -n "$name" ] && [ "$name" != white ] &&
+			textcolor_seq "$name" 2>/dev/null; then
+			:
+		elif [ -n "$TC_VT_CHANGED" ]; then
+			TC_SEQ='\033]R'
+		else
+			exit 0
+		fi
 	else
 		# apply|restart|reload: a missing key or a bad name goes
 		# back to stock (white == ]R).

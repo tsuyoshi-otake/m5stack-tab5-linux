@@ -1005,17 +1005,23 @@ _pal_apply() {
 _tc_now=""
 _pal_restore() {
 	[ "$_pal_on" = 1 ] || return 0
-	printf '\033]R'
 	_pal_on=0
 	# With the menu palette gone the panel goes back to the
 	# configured text colour.  Builtins only -- this runs at
 	# session teardown with ~1.5 MB free on NOMMU.
-	[ -n "${TEXTCOLOR_NAMES:-}" ] || return 0
-	_name=${_tc_now:-}
-	if [ -z "$_name" ]; then
-		cfg_get text_color 2>/dev/null || CFG_VAL=""
-		_name=$CFG_VAL
+	_name=""
+	if [ -n "${TEXTCOLOR_NAMES:-}" ]; then
+		_name=${_tc_now:-}
+		if [ -z "$_name" ]; then
+			cfg_get text_color 2>/dev/null || CFG_VAL=""
+			_name=$CFG_VAL
+		fi
+		# ESC ] R loads the kernel's palette defaults, which boot
+		# set to the text colour of that time: this one first.
+		textcolor_vtdefaults "$_name"
 	fi
+	printf '\033]R'
+	[ -n "${TEXTCOLOR_NAMES:-}" ] || return 0
 	TC_BG=""
 	[ -n "$_name" ] && textcolor_seq "$_name" 2>/dev/null &&
 		printf "$TC_SEQ"
